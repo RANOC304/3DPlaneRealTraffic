@@ -30,6 +30,7 @@ type FlightResponse = {
   sourceTimestamp: number;
   receivedAt: number;
   refreshAfter: number;
+  nextRefreshAt: number;
   count: number;
   aircraft: Array<{
     id: string;
@@ -54,6 +55,7 @@ type FlightResponse = {
 
 let tokenCache: TokenCache = null;
 let flightCache: FlightCache = null;
+let inflightSnapshot: Promise<FlightResponse> | null = null;
 
 async function getToken() {
   const clientId = process.env.OPENSKY_CLIENT_ID;
@@ -87,6 +89,72 @@ async function getToken() {
   return tokenCache.token;
 }
 
+async function fetchSnapshot(): Promise<FlightResponse> {
+  const token = await getToken();
+  const response = await fetch('https://opensky-network.org/api/states/all?extended=1', {
+    headers: token ? { authorization: `Bearer ${token}` } : undefined,
+    cache: 'no-store',
+    signal: AbortSignal.timeout(22_000),
+  });
+
+  if (!response.ok) {
+    const retryAfter = response.headers.get('x-rate-limit-retry-after-seconds');
+    throw new Error(
+      response.status === 429
+        ? `OpenSky daily limit reached${retryAfter ? `; retry in ${retryAfter}s` : ''}`
+        : `OpenSky returned ${response.status}`,
+    );
+  }
+
+  const raw = (await response.json()) as { time: number; states: OpenSkyState[] | null };
+  const aircraft = (raw.states ?? []).flatMap((state) => {
+    const lon = state[5];
+    const lat = state[6];
+    if (lon === null || lat === null) return [];
+
+    return [{
+      id: state[0],
+      callsign: state[1]?.trim() || state[0].toUpperCase(),
+      country: state[2] || 'Unknown',
+      lat,
+      lon,
+      altitude: state[7] ?? state[13] ?? 0,
+      geoAltitude: state[13],
+      onGround: state[8],
+      speed: state[9] ?? 0,
+      heading: state[10] ?? 0,
+      verticalRate: state[11] ?? 0,
+      positionTime: state[3] ?? state[4],
+      lastContact: state[4],
+      squawk: state[14],
+      spi: state[15],
+      positionSource: state[16],
+      category: state[17] ?? 0,
+    }];
+  });
+
+  const authenticated = Boolean(token);
+  // A global snapshot costs four credits. Ninety seconds stays below the
+  // free authenticated daily allowance while anonymous mode needs 15 minutes.
+  const refreshAfter = authenticated ? 90 : 900;
+  const expiresAt = Date.now() + refreshAfter * 1000;
+  const body: FlightResponse = {
+    source: 'opensky',
+    mode: authenticated ? 'authenticated' : 'anonymous',
+    sourceTimestamp: raw.time,
+    receivedAt: Math.floor(Date.now() / 1000),
+    refreshAfter,
+    // Absolute time the next snapshot becomes available, so clients can wake up
+    // exactly then instead of re-downloading this one on a blind interval.
+    nextRefreshAt: Math.ceil(expiresAt / 1000),
+    count: aircraft.length,
+    aircraft,
+  };
+
+  flightCache = { body, expiresAt };
+  return body;
+}
+
 export async function GET() {
   if (flightCache && flightCache.expiresAt > Date.now()) {
     return NextResponse.json(flightCache.body, {
@@ -98,64 +166,11 @@ export async function GET() {
   }
 
   try {
-    const token = await getToken();
-    const response = await fetch('https://opensky-network.org/api/states/all?extended=1', {
-      headers: token ? { authorization: `Bearer ${token}` } : undefined,
-      cache: 'no-store',
-      signal: AbortSignal.timeout(22_000),
-    });
-
-    if (!response.ok) {
-      const retryAfter = response.headers.get('x-rate-limit-retry-after-seconds');
-      throw new Error(
-        response.status === 429
-          ? `OpenSky daily limit reached${retryAfter ? `; retry in ${retryAfter}s` : ''}`
-          : `OpenSky returned ${response.status}`,
-      );
-    }
-
-    const raw = (await response.json()) as { time: number; states: OpenSkyState[] | null };
-    const aircraft = (raw.states ?? []).flatMap((state) => {
-      const lon = state[5];
-      const lat = state[6];
-      if (lon === null || lat === null) return [];
-
-      return [{
-        id: state[0],
-        callsign: state[1]?.trim() || state[0].toUpperCase(),
-        country: state[2] || 'Unknown',
-        lat,
-        lon,
-        altitude: state[7] ?? state[13] ?? 0,
-        geoAltitude: state[13],
-        onGround: state[8],
-        speed: state[9] ?? 0,
-        heading: state[10] ?? 0,
-        verticalRate: state[11] ?? 0,
-        positionTime: state[3] ?? state[4],
-        lastContact: state[4],
-        squawk: state[14],
-        spi: state[15],
-        positionSource: state[16],
-        category: state[17] ?? 0,
-      }];
-    });
-
-    const authenticated = Boolean(token);
-    // A global snapshot costs four credits. Ninety seconds stays below the
-    // free authenticated daily allowance while anonymous mode needs 15 minutes.
-    const refreshAfter = authenticated ? 90 : 900;
-    const body: FlightResponse = {
-      source: 'opensky',
-      mode: authenticated ? 'authenticated' : 'anonymous',
-      sourceTimestamp: raw.time,
-      receivedAt: Math.floor(Date.now() / 1000),
-      refreshAfter,
-      count: aircraft.length,
-      aircraft,
-    };
-
-    flightCache = { body, expiresAt: Date.now() + refreshAfter * 1000 };
+    // Collapse concurrent misses into one upstream snapshot. Anonymous access
+    // allows only ~100 global requests a day, so several clients refreshing at
+    // the same moment must not each spend one.
+    inflightSnapshot ??= fetchSnapshot().finally(() => { inflightSnapshot = null; });
+    const body = await inflightSnapshot;
 
     return NextResponse.json(body, {
       headers: {
