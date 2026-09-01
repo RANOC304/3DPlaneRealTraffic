@@ -485,12 +485,12 @@ function mapZoom(distance: number) {
   return 18;
 }
 
-function mapViewForPosition(position: Vector3): MapView {
-  const distance = position.length();
-  if (distance < 0.001) return { zoom: 3, x: 4, y: 4 };
-  const zoom = mapZoom(distance);
+function mapViewForPosition(position: Vector3, cameraDistance = position.length()): MapView {
+  const positionDistance = position.length();
+  if (positionDistance < 0.001) return { zoom: 3, x: 4, y: 4 };
+  const zoom = mapZoom(cameraDistance);
   const tileCount = 2 ** zoom;
-  const lat = Math.max(-85.05112878, Math.min(85.05112878, Math.asin(position.y / distance) / degrees));
+  const lat = Math.max(-85.05112878, Math.min(85.05112878, Math.asin(position.y / positionDistance) / degrees));
   const lon = ((Math.atan2(position.z, -position.x) / degrees - 180) + 540) % 360 - 180;
   const latitudeRadians = lat * degrees;
   const x = Math.max(0, Math.min(tileCount - 1, Math.floor(((lon + 180) / 360) * tileCount)));
@@ -498,6 +498,24 @@ function mapViewForPosition(position: Vector3): MapView {
     ((1 - Math.log(Math.tan(latitudeRadians) + 1 / Math.cos(latitudeRadians)) / Math.PI) / 2) * tileCount,
   )));
   return { zoom, x, y };
+}
+
+function mapAnchorForCamera(position: Vector3, direction: Vector3, target: Vector3) {
+  const projection = position.dot(direction);
+  const discriminant = projection * projection - (position.lengthSq() - earthRadius * earthRadius);
+  if (discriminant >= 0) {
+    const root = Math.sqrt(discriminant);
+    const nearIntersection = -projection - root;
+    const farIntersection = -projection + root;
+    const distance = nearIntersection >= 0 ? nearIntersection : farIntersection;
+    if (distance >= 0) {
+      return target.copy(direction).multiplyScalar(distance).add(position).normalize().multiplyScalar(earthRadius);
+    }
+  }
+
+  // When the camera looks into space, keep the tiles centered beneath it so
+  // turning back toward the horizon never reveals an unloaded black region.
+  return target.copy(position).normalize().multiplyScalar(earthRadius);
 }
 
 function mapTileUrl(zoom: number, x: number, y: number) {
@@ -671,13 +689,17 @@ function DetailedEarthMap() {
   const { camera } = useThree();
   const [view, setView] = useState<MapView>(() => mapViewForPosition(camera.position));
   const lastCheck = useRef(0);
+  const viewDirection = useMemo(() => new Vector3(), []);
+  const viewAnchor = useMemo(() => new Vector3(), []);
   const tiles = useMemo(() => mapTilesForView(view), [view]);
 
   useFrame(() => {
     const now = performance.now();
     if (now - lastCheck.current < 180) return;
     lastCheck.current = now;
-    const next = mapViewForPosition(camera.position);
+    camera.getWorldDirection(viewDirection).normalize();
+    mapAnchorForCamera(camera.position, viewDirection, viewAnchor);
+    const next = mapViewForPosition(viewAnchor, camera.position.length());
     setView((current) => (
       current.zoom === next.zoom && current.x === next.x && current.y === next.y ? current : next
     ));
@@ -722,9 +744,9 @@ function Earth() {
 
   return (
     <group>
-      <mesh castShadow receiveShadow>
+      <mesh>
         <sphereGeometry args={[earthBaseRadius, 96, 96]} />
-        <meshStandardMaterial map={texture} roughness={0.9} metalness={0.02} />
+        <meshBasicMaterial map={texture} toneMapped={false} />
       </mesh>
       <DetailedEarthMap />
       <Atmosphere />
