@@ -303,6 +303,12 @@ const categoryLabels: Record<number, string> = {
 
 const sourceLabels = ['ADS-B', 'ASTERIX', 'MLAT', 'FLARM'];
 const earthRadius = 2.4;
+// Keep the fallback globe just beneath the satellite mesh, and reserve a tiny
+// air gap above that mesh for the closest possible camera position.
+const earthBaseRadius = earthRadius - 0.0002;
+const mapSurfaceRadius = earthRadius + 0.00001;
+const minimumCameraAltitude = 0.0002;
+const minimumCameraRadius = earthRadius + minimumCameraAltitude;
 const earthKilometers = 6371;
 const upVector = new Vector3(0, 1, 0);
 const degrees = Math.PI / 180;
@@ -472,7 +478,11 @@ function mapZoom(distance: number) {
   if (altitude > 0.0035) return 11;
   if (altitude > 0.0015) return 12;
   if (altitude > 0.0007) return 13;
-  return 14;
+  if (altitude > 0.0005) return 14;
+  if (altitude > 0.00038) return 15;
+  if (altitude > 0.0003) return 16;
+  if (altitude > 0.00025) return 17;
+  return 18;
 }
 
 function mapViewForPosition(position: Vector3): MapView {
@@ -525,7 +535,7 @@ function buildMapTileGeometry(tile: MapTile) {
   // triangles bow through the base globe unless their angular step stays small;
   // that intersection was the repeated black-diamond pattern on the map.
   const segments = Math.max(3, Math.ceil(360 / tileCount));
-  const radius = earthRadius + 0.001;
+  const radius = mapSurfaceRadius;
   const positions: number[] = [];
   const uvs: number[] = [];
   const indices: number[] = [];
@@ -562,6 +572,32 @@ function buildMapTileGeometry(tile: MapTile) {
   return geometry;
 }
 
+function isBlankSatelliteTexture(texture: Texture) {
+  try {
+    const canvas = document.createElement('canvas');
+    canvas.width = 8;
+    canvas.height = 8;
+    const context = canvas.getContext('2d', { willReadFrequently: true });
+    if (!context || !texture.image) return false;
+    context.drawImage(texture.image as CanvasImageSource, 0, 0, 8, 8);
+    const pixels = context.getImageData(0, 0, 8, 8).data;
+    let minimumLight = 255;
+    let maximumLight = 0;
+    let maximumChroma = 0;
+    for (let index = 0; index < pixels.length; index += 4) {
+      const red = pixels[index];
+      const green = pixels[index + 1];
+      const blue = pixels[index + 2];
+      minimumLight = Math.min(minimumLight, red, green, blue);
+      maximumLight = Math.max(maximumLight, red, green, blue);
+      maximumChroma = Math.max(maximumChroma, Math.abs(red - green), Math.abs(green - blue), Math.abs(blue - red));
+    }
+    return minimumLight > 170 && maximumLight - minimumLight < 55 && maximumChroma < 5;
+  } catch {
+    return false;
+  }
+}
+
 function DetailedMapTile({ tile }: { tile: MapTile }) {
   const { gl } = useThree();
   const geometry = useMemo(() => buildMapTileGeometry(tile), [tile.x, tile.y, tile.zoom]);
@@ -572,22 +608,43 @@ function DetailedMapTile({ tile }: { tile: MapTile }) {
     let loadedTexture: Texture | null = null;
     const loader = new TextureLoader();
     loader.setCrossOrigin('anonymous');
-    loader.load(
-      tile.url,
-      (loaded) => {
-        loadedTexture = loaded;
-        if (!active) {
-          loaded.dispose();
-          return;
-        }
-        loaded.colorSpace = SRGBColorSpace;
-        loaded.anisotropy = Math.min(16, gl.capabilities.getMaxAnisotropy());
-        loaded.needsUpdate = true;
-        setTexture(loaded);
-      },
-      undefined,
-      () => {},
-    );
+
+    const loadAvailableTile = (zoom: number, x: number, y: number) => {
+      loader.load(
+        mapTileUrl(zoom, x, y),
+        (loaded) => {
+          if (!active) {
+            loaded.dispose();
+            return;
+          }
+          if (zoom > 3 && isBlankSatelliteTexture(loaded)) {
+            loaded.dispose();
+            loadAvailableTile(zoom - 1, Math.floor(x / 2), Math.floor(y / 2));
+            return;
+          }
+
+          const levelDifference = tile.zoom - zoom;
+          const parentScale = 2 ** levelDifference;
+          const repeat = 1 / parentScale;
+          loaded.repeat.set(repeat, repeat);
+          loaded.offset.set(
+            (tile.x % parentScale) * repeat,
+            (parentScale - 1 - (tile.y % parentScale)) * repeat,
+          );
+          loadedTexture = loaded;
+          loaded.colorSpace = SRGBColorSpace;
+          loaded.anisotropy = Math.min(16, gl.capabilities.getMaxAnisotropy());
+          loaded.needsUpdate = true;
+          setTexture(loaded);
+        },
+        undefined,
+        () => {
+          if (active && zoom > 3) loadAvailableTile(zoom - 1, Math.floor(x / 2), Math.floor(y / 2));
+        },
+      );
+    };
+
+    loadAvailableTile(tile.zoom, tile.x, tile.y);
     return () => {
       active = false;
       loadedTexture?.dispose();
@@ -666,7 +723,7 @@ function Earth() {
   return (
     <group>
       <mesh castShadow receiveShadow>
-        <sphereGeometry args={[earthRadius, 96, 96]} />
+        <sphereGeometry args={[earthBaseRadius, 96, 96]} />
         <meshStandardMaterial map={texture} roughness={0.9} metalness={0.02} />
       </mesh>
       <DetailedEarthMap />
@@ -1472,6 +1529,24 @@ function CameraDirector({
   return null;
 }
 
+function EarthSurfaceCollision() {
+  const { camera } = useThree();
+
+  useFrame(() => {
+    const distance = camera.position.length();
+    if (distance >= minimumCameraRadius) return;
+
+    if (distance < 1e-9) {
+      camera.position.set(minimumCameraRadius, 0, 0);
+      return;
+    }
+
+    camera.position.multiplyScalar(minimumCameraRadius / distance);
+  });
+
+  return null;
+}
+
 function GlobeScene({
   aircraft,
   selected,
@@ -1532,7 +1607,7 @@ function GlobeScene({
         rotateSpeed={0.48}
         zoomSpeed={0.72}
         panSpeed={0.65}
-        minDistance={0.0008}
+        minDistance={minimumCameraAltitude}
         maxDistance={30}
         enablePan
         target={orbitTarget}
@@ -1545,6 +1620,7 @@ function GlobeScene({
       />
       <FlyMovement active={flyMode} speed={speed} />
       <CameraDirector selected={selected} predictive={predictive} follow={follow} focusRequest={focusRequest} resetRequest={resetRequest} motionScale={motionScale} onPosition={onPosition} />
+      <EarthSurfaceCollision />
     </>
   );
 }
@@ -1760,7 +1836,7 @@ export function AirTrafficApp() {
   return (
     <main className="relative h-dvh w-full overflow-hidden bg-[#02070c] text-slate-100 selection:bg-cyan-300/25">
       <div className="absolute inset-0">
-        <Canvas camera={{ position: [0, 0.3, 6.7], fov: 43, near: 0.00001, far: 150 }} dpr={[1, 2]} gl={{ antialias: true, logarithmicDepthBuffer: true, powerPreference: 'high-performance' }}>
+        <Canvas camera={{ position: [0, 0.3, 6.7], fov: 43, near: 0.000002, far: 150 }} dpr={[1, 2]} gl={{ antialias: true, logarithmicDepthBuffer: true, powerPreference: 'high-performance' }}>
           <GlobeScene
             aircraft={filteredAircraft}
             selected={selected}
