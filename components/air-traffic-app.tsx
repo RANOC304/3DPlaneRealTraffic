@@ -34,14 +34,21 @@ import {
 } from 'react';
 import {
   BackSide,
+  BoxGeometry,
+  BufferGeometry,
+  CapsuleGeometry,
   Color,
+  ConeGeometry,
+  CylinderGeometry,
   DynamicDrawUsage,
+  Euler,
   InstancedMesh,
   Object3D,
   Quaternion,
   SRGBColorSpace,
   Vector3,
 } from 'three';
+import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -237,13 +244,81 @@ function Earth() {
   );
 }
 
+type AircraftVariant = 'jet' | 'heavy' | 'light' | 'rotor';
+
+function aircraftVariant(category: number): AircraftVariant {
+  if (category === 8) return 'rotor';
+  if ([2, 9, 12, 14].includes(category)) return 'light';
+  if ([5, 6].includes(category)) return 'heavy';
+  return 'jet';
+}
+
+function modelPart(
+  geometry: BufferGeometry,
+  position: [number, number, number] = [0, 0, 0],
+  rotation: [number, number, number] = [0, 0, 0],
+  scale: [number, number, number] = [1, 1, 1],
+) {
+  geometry.scale(...scale);
+  geometry.rotateX(rotation[0]);
+  geometry.rotateY(rotation[1]);
+  geometry.rotateZ(rotation[2]);
+  geometry.translate(...position);
+  if (!geometry.index) return geometry;
+  const nonIndexed = geometry.toNonIndexed();
+  geometry.dispose();
+  return nonIndexed;
+}
+
+function createFleetAircraftGeometry(variant: AircraftVariant) {
+  const parts: BufferGeometry[] = [];
+
+  if (variant === 'rotor') {
+    parts.push(
+      modelPart(new CapsuleGeometry(0.012, 0.025, 2, 6), [0, 0, -0.008], [Math.PI / 2, 0, 0], [1.2, 1, 1]),
+      modelPart(new BoxGeometry(0.007, 0.007, 0.05), [0, 0, 0.035]),
+      modelPart(new BoxGeometry(0.105, 0.0025, 0.006), [0, 0.017, -0.004], [0, 0.22, 0]),
+      modelPart(new BoxGeometry(0.006, 0.0025, 0.105), [0, 0.017, -0.004], [0, 0.22, 0]),
+      modelPart(new BoxGeometry(0.028, 0.003, 0.004), [0.004, 0.007, 0.06], [0, 0, Math.PI / 2]),
+    );
+  } else {
+    const heavyScale = variant === 'heavy' ? 1.22 : variant === 'light' ? 0.78 : 1;
+    const wingSpan = variant === 'heavy' ? 0.112 : variant === 'light' ? 0.075 : 0.094;
+    const bodyLength = variant === 'heavy' ? 0.057 : variant === 'light' ? 0.038 : 0.048;
+    parts.push(
+      modelPart(new CapsuleGeometry(0.009, bodyLength, 2, 7), [0, 0, 0], [Math.PI / 2, 0, 0], [1, 1, heavyScale]),
+      modelPart(new ConeGeometry(0.009, 0.019, 7), [0, 0, -(bodyLength / 2 + 0.014)], [Math.PI / 2, 0, 0]),
+      modelPart(new BoxGeometry(wingSpan, 0.004, variant === 'light' ? 0.014 : 0.02), [0, 0, -0.004], [0, -0.08, 0]),
+      modelPart(new BoxGeometry(wingSpan * 0.4, 0.0035, 0.011), [0, 0.004, bodyLength / 2 + 0.015], [0, 0.05, 0]),
+      modelPart(new ConeGeometry(0.012, 0.025, 3), [0, 0.012, bodyLength / 2 + 0.014], [0, 0, 0], [0.55, 1, 1]),
+    );
+    if (variant !== 'light') {
+      parts.push(
+        modelPart(new CylinderGeometry(0.0055, 0.0065, 0.018, 6), [-wingSpan * 0.24, -0.003, -0.008], [Math.PI / 2, 0, 0]),
+        modelPart(new CylinderGeometry(0.0055, 0.0065, 0.018, 6), [wingSpan * 0.24, -0.003, -0.008], [Math.PI / 2, 0, 0]),
+      );
+    } else {
+      parts.push(modelPart(new BoxGeometry(0.032, 0.0025, 0.004), [0, 0, -(bodyLength / 2 + 0.023)], [0, 0.18, 0]));
+    }
+  }
+
+  const merged = mergeGeometries(parts, false);
+  if (!merged) throw new Error('Unable to construct aircraft geometry');
+  merged.computeVertexNormals();
+  merged.computeBoundingSphere();
+  parts.forEach((part) => part.dispose());
+  return merged;
+}
+
 function AircraftInstances({
   aircraft,
+  variant,
   selectedId,
   predictive,
   onSelect,
 }: {
   aircraft: Aircraft[];
+  variant: AircraftVariant;
   selectedId?: string;
   predictive: boolean;
   onSelect: (flight: Aircraft) => void;
@@ -253,6 +328,7 @@ function AircraftInstances({
   const orientation = useMemo(() => new Quaternion(), []);
   const radial = useMemo(() => new Vector3(), []);
   const headingRotation = useMemo(() => new Quaternion(), []);
+  const geometry = useMemo(() => createFleetAircraftGeometry(variant), [variant]);
   const lastUpdate = useRef(0);
 
   const updateMatrices = useCallback((timestamp: number) => {
@@ -266,7 +342,7 @@ function AircraftInstances({
       orientation.premultiply(headingRotation);
       dummy.position.copy(position);
       dummy.quaternion.copy(orientation);
-      const scale = flight.id === selectedId ? 1.7 : flight.onGround ? 0.72 : 1;
+      const scale = flight.id === selectedId ? 1.3 : flight.onGround ? 0.78 : 1;
       dummy.scale.setScalar(scale);
       dummy.updateMatrix();
       mesh.setMatrixAt(index, dummy.matrix);
@@ -298,9 +374,116 @@ function AircraftInstances({
       onPointerOver={() => { document.body.style.cursor = 'pointer'; }}
       onPointerOut={() => { document.body.style.cursor = 'default'; }}
     >
-      <coneGeometry args={[0.022, 0.07, 3]} />
-      <meshBasicMaterial color="#68e8ff" toneMapped={false} />
+      <primitive object={geometry} attach="geometry" />
+      <meshStandardMaterial
+        color={variant === 'heavy' ? '#dff7ff' : variant === 'rotor' ? '#ffd479' : variant === 'light' ? '#8cecff' : '#b9f1ff'}
+        emissive={variant === 'rotor' ? '#8a5100' : '#0b7f9a'}
+        emissiveIntensity={0.5}
+        metalness={0.28}
+        roughness={0.38}
+      />
     </instancedMesh>
+  );
+}
+
+function AircraftFleet(props: Omit<Parameters<typeof AircraftInstances>[0], 'aircraft' | 'variant'> & { aircraft: Aircraft[] }) {
+  const buckets = useMemo(() => {
+    const result: Record<AircraftVariant, Aircraft[]> = { jet: [], heavy: [], light: [], rotor: [] };
+    props.aircraft.forEach((flight) => result[aircraftVariant(flight.category)].push(flight));
+    return result;
+  }, [props.aircraft]);
+
+  return (
+    <>
+      {(Object.keys(buckets) as AircraftVariant[]).map((variant) => (
+        <AircraftInstances key={variant} {...props} variant={variant} aircraft={buckets[variant]} />
+      ))}
+    </>
+  );
+}
+
+function DetailedJetModel({ variant }: { variant: AircraftVariant }) {
+  const light = variant === 'light';
+  const heavy = variant === 'heavy';
+  const bodyLength = light ? 0.13 : heavy ? 0.23 : 0.19;
+  const wingSpan = light ? 0.18 : heavy ? 0.34 : 0.28;
+  const bodyRadius = light ? 0.021 : heavy ? 0.034 : 0.029;
+  const windowPositions = light ? [-0.025, 0.012] : [-0.055, -0.025, 0.005, 0.035, 0.065];
+
+  return (
+    <group>
+      <mesh rotation={[Math.PI / 2, 0, 0]} castShadow>
+        <capsuleGeometry args={[bodyRadius, bodyLength, 6, 14]} />
+        <meshStandardMaterial color="#e8f1f4" metalness={0.45} roughness={0.28} />
+      </mesh>
+      <mesh position={[0, 0, -(bodyLength / 2 + bodyRadius * 0.78)]} rotation={[Math.PI / 2, 0, 0]} castShadow>
+        <coneGeometry args={[bodyRadius * 0.93, bodyRadius * 1.75, 14]} />
+        <meshStandardMaterial color="#dce9ed" metalness={0.5} roughness={0.24} />
+      </mesh>
+      <mesh position={[0, bodyRadius * 0.55, -(bodyLength / 2 + bodyRadius * 0.46)]} scale={[0.72, 0.36, 0.72]}>
+        <sphereGeometry args={[bodyRadius, 12, 8]} />
+        <meshStandardMaterial color="#082434" metalness={0.72} roughness={0.12} />
+      </mesh>
+      <mesh position={[0, 0, -0.008]} rotation={[0, -0.08, 0]} castShadow>
+        <boxGeometry args={[wingSpan, 0.009, light ? 0.055 : 0.075]} />
+        <meshStandardMaterial color="#cddde2" metalness={0.52} roughness={0.3} />
+      </mesh>
+      <mesh position={[0, 0.006, bodyLength / 2 + 0.012]} rotation={[0, 0.05, 0]} castShadow>
+        <boxGeometry args={[wingSpan * 0.38, 0.008, light ? 0.032 : 0.042]} />
+        <meshStandardMaterial color="#dce7ea" metalness={0.48} roughness={0.32} />
+      </mesh>
+      <mesh position={[0, bodyRadius * 0.95, bodyLength / 2 + 0.012]}>
+        <coneGeometry args={[bodyRadius * 0.8, light ? 0.055 : 0.075, 3]} />
+        <meshStandardMaterial color="#b9cdd4" metalness={0.42} roughness={0.3} />
+      </mesh>
+      {!light ? (
+        <>
+          {[-1, 1].map((side) => (
+            <mesh key={side} position={[side * wingSpan * 0.26, -0.012, -0.026]} rotation={[Math.PI / 2, 0, 0]} castShadow>
+              <cylinderGeometry args={[bodyRadius * 0.32, bodyRadius * 0.38, heavy ? 0.065 : 0.052, 12]} />
+              <meshStandardMaterial color="#708791" metalness={0.7} roughness={0.2} />
+            </mesh>
+          ))}
+        </>
+      ) : (
+        <mesh position={[0, 0, -(bodyLength / 2 + bodyRadius * 1.9)]} rotation={[0.06, 0.18, 0]}>
+          <boxGeometry args={[0.105, 0.005, 0.008]} />
+          <meshStandardMaterial color="#162b33" metalness={0.55} roughness={0.25} />
+        </mesh>
+      )}
+      {windowPositions.map((z) => (
+        <group key={z}>
+          <mesh position={[-bodyRadius * 0.96, bodyRadius * 0.28, z]}><boxGeometry args={[0.0025, 0.008, 0.012]} /><meshBasicMaterial color="#183c4a" /></mesh>
+          <mesh position={[bodyRadius * 0.96, bodyRadius * 0.28, z]}><boxGeometry args={[0.0025, 0.008, 0.012]} /><meshBasicMaterial color="#183c4a" /></mesh>
+        </group>
+      ))}
+      <mesh position={[-wingSpan / 2, 0, -0.008]}><sphereGeometry args={[0.008, 8, 8]} /><meshBasicMaterial color="#ff3157" toneMapped={false} /></mesh>
+      <mesh position={[wingSpan / 2, 0, -0.008]}><sphereGeometry args={[0.008, 8, 8]} /><meshBasicMaterial color="#46ffae" toneMapped={false} /></mesh>
+      <mesh position={[0, 0, bodyLength / 2 + 0.05]}><sphereGeometry args={[0.006, 8, 8]} /><meshBasicMaterial color="#ffffff" toneMapped={false} /></mesh>
+    </group>
+  );
+}
+
+function DetailedRotorModel() {
+  const mainRotor = useRef<Object3D>(null);
+  const tailRotor = useRef<Object3D>(null);
+  useFrame((_, delta) => {
+    if (mainRotor.current) mainRotor.current.rotation.y += delta * 15;
+    if (tailRotor.current) tailRotor.current.rotation.x += delta * 20;
+  });
+
+  return (
+    <group>
+      <mesh position={[0, 0, -0.025]} rotation={[Math.PI / 2, 0, 0]} castShadow><capsuleGeometry args={[0.038, 0.065, 6, 12]} /><meshStandardMaterial color="#dfe8e8" metalness={0.42} roughness={0.3} /></mesh>
+      <mesh position={[0, 0.01, -0.073]} scale={[1, 0.72, 1.15]}><sphereGeometry args={[0.037, 12, 10]} /><meshStandardMaterial color="#163d4d" metalness={0.66} roughness={0.15} /></mesh>
+      <mesh position={[0, 0.004, 0.08]}><boxGeometry args={[0.018, 0.018, 0.16]} /><meshStandardMaterial color="#9fb5bc" metalness={0.55} roughness={0.28} /></mesh>
+      <group ref={mainRotor} position={[0, 0.06, -0.015]}><mesh><boxGeometry args={[0.38, 0.005, 0.014]} /><meshStandardMaterial color="#344850" metalness={0.65} roughness={0.2} /></mesh><mesh><boxGeometry args={[0.014, 0.005, 0.38]} /><meshStandardMaterial color="#344850" metalness={0.65} roughness={0.2} /></mesh></group>
+      <group ref={tailRotor} position={[0.012, 0.018, 0.165]} rotation={[0, 0, Math.PI / 2]}><mesh><boxGeometry args={[0.09, 0.004, 0.01]} /><meshBasicMaterial color="#d7f4fb" /></mesh><mesh rotation={[0, 0, Math.PI / 2]}><boxGeometry args={[0.09, 0.004, 0.01]} /><meshBasicMaterial color="#d7f4fb" /></mesh></group>
+      <mesh position={[-0.04, -0.045, -0.01]}><boxGeometry args={[0.012, 0.008, 0.15]} /><meshStandardMaterial color="#536870" /></mesh>
+      <mesh position={[0.04, -0.045, -0.01]}><boxGeometry args={[0.012, 0.008, 0.15]} /><meshStandardMaterial color="#536870" /></mesh>
+      <mesh position={[-0.2, 0.06, -0.015]}><sphereGeometry args={[0.009, 8, 8]} /><meshBasicMaterial color="#ff3157" toneMapped={false} /></mesh>
+      <mesh position={[0.2, 0.06, -0.015]}><sphereGeometry args={[0.009, 8, 8]} /><meshBasicMaterial color="#46ffae" toneMapped={false} /></mesh>
+    </group>
   );
 }
 
@@ -330,20 +513,9 @@ function SelectedAircraft({ flight, predictive, paths }: { flight: Aircraft; pre
     <>
       {paths && <Line points={trail} color="#dfff65" lineWidth={1} transparent opacity={0.5} />}
       <group ref={group}>
-        <mesh position={[0, 0.012, 0]}>
-          <boxGeometry args={[0.028, 0.018, 0.15]} />
-          <meshBasicMaterial color="#efff6d" toneMapped={false} />
-        </mesh>
-        <mesh position={[0, 0.012, -0.006]}>
-          <boxGeometry args={[0.15, 0.012, 0.032]} />
-          <meshBasicMaterial color="#efff6d" toneMapped={false} />
-        </mesh>
-        <mesh position={[0, 0.018, 0.055]}>
-          <boxGeometry args={[0.065, 0.012, 0.02]} />
-          <meshBasicMaterial color="#efff6d" toneMapped={false} />
-        </mesh>
+        {aircraftVariant(flight.category) === 'rotor' ? <DetailedRotorModel /> : <DetailedJetModel variant={aircraftVariant(flight.category)} />}
         <mesh position={[0, 0, 0]} rotation={[Math.PI / 2, 0, 0]}>
-          <ringGeometry args={[0.09, 0.105, 32]} />
+          <ringGeometry args={[0.2, 0.215, 48]} />
           <meshBasicMaterial color="#efff6d" transparent opacity={0.7} side={2} depthWrite={false} />
         </mesh>
         <pointLight color="#eaff62" intensity={2.4} distance={0.9} />
@@ -487,7 +659,7 @@ function GlobeScene({
       <directionalLight position={[5, 2, 4]} intensity={3.15} color={new Color('#d9f4ff')} />
       <pointLight position={[-4, -1, -3]} intensity={2.1} color="#0a4f7c" />
       <Suspense fallback={null}><Earth /></Suspense>
-      <AircraftInstances aircraft={aircraft} selectedId={selected?.id} predictive={predictive} onSelect={onSelect} />
+      <AircraftFleet aircraft={aircraft} selectedId={selected?.id} predictive={predictive} onSelect={onSelect} />
       {selected && <SelectedAircraft flight={selected} predictive={predictive} paths={paths} />}
       <Stars radius={70} depth={38} count={2400} factor={2.1} saturation={0.25} fade speed={0.2} />
       <OrbitControls
