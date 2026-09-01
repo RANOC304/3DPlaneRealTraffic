@@ -68,6 +68,7 @@ type Aircraft = {
   speed: number;
   heading: number;
   verticalRate: number;
+  positionTime: number;
   lastContact: number;
   squawk: string | null;
   spi: boolean;
@@ -121,6 +122,7 @@ const previewFlights: Aircraft[] = [
   speed: speed as number,
   heading: heading as number,
   verticalRate: verticalRate as number,
+  positionTime: nowSeconds(),
   lastContact: nowSeconds(),
   squawk: null,
   spi: false,
@@ -168,7 +170,7 @@ function predictCoordinates(flight: Aircraft, timestamp: number, extraSeconds = 
 }
 
 function predictionSeconds(flight: Aircraft, timestamp: number, extraSeconds = 0) {
-  return Math.max(-900, Math.min(900, timestamp - flight.lastContact + extraSeconds));
+  return Math.max(-900, Math.min(900, timestamp - (flight.positionTime ?? flight.lastContact) + extraSeconds));
 }
 
 function globePosition(
@@ -337,6 +339,7 @@ function AircraftInstances({
   predictive: boolean;
   onSelect: (flight: Aircraft) => void;
 }) {
+  const { camera } = useThree();
   const ref = useRef<InstancedMesh>(null);
   const dummy = useMemo(() => new Object3D(), []);
   const orientation = useMemo(() => new Quaternion(), []);
@@ -373,13 +376,17 @@ function AircraftInstances({
       }
       dummy.position.copy(position);
       dummy.quaternion.copy(smoothOrientation);
-      const scale = flight.id === selectedId ? 1.3 : flight.onGround ? 0.78 : 1;
+      // Aircraft must be exaggerated from orbit to remain visible. Shrink that
+      // exaggeration near the camera so true-speed geographic motion becomes
+      // clearly visible in regional and close views.
+      const distanceScale = Math.max(0.0035, Math.min(1, position.distanceTo(camera.position) / 4.5));
+      const scale = flight.id === selectedId ? 0 : distanceScale * (flight.onGround ? 0.78 : 1);
       dummy.scale.setScalar(scale);
       dummy.updateMatrix();
       mesh.setMatrixAt(index, dummy.matrix);
     });
     mesh.instanceMatrix.needsUpdate = true;
-  }, [aircraft, dummy, headingRotation, orientation, predictive, radial, selectedId, targetPosition]);
+  }, [aircraft, camera, dummy, headingRotation, orientation, predictive, radial, selectedId, targetPosition]);
 
   useEffect(() => {
     const visibleIds = new Set(aircraft.map((flight) => flight.id));
@@ -526,6 +533,7 @@ function DetailedRotorModel() {
 }
 
 function SelectedAircraft({ flight, predictive, paths }: { flight: Aircraft; predictive: boolean; paths: boolean }) {
+  const { camera } = useThree();
   const group = useRef<Object3D>(null);
   const position = useMemo(() => new Vector3(), []);
   const radial = useMemo(() => new Vector3(), []);
@@ -544,6 +552,8 @@ function SelectedAircraft({ flight, predictive, paths }: { flight: Aircraft; pre
     quaternion.setFromUnitVectors(upVector, radial);
     headingRotation.setFromAxisAngle(radial, -flight.heading * (Math.PI / 180));
     quaternion.premultiply(headingRotation);
+    const distanceScale = Math.max(0.003, Math.min(1, camera.position.distanceTo(position) / 4.5));
+    group.current.scale.setScalar(distanceScale);
     if (!initialized.current) {
       group.current.position.copy(position);
       group.current.quaternion.copy(quaternion);
@@ -564,7 +574,7 @@ function SelectedAircraft({ flight, predictive, paths }: { flight: Aircraft; pre
           <ringGeometry args={[0.2, 0.215, 48]} />
           <meshBasicMaterial color="#efff6d" transparent opacity={0.7} side={2} depthWrite={false} />
         </mesh>
-        <pointLight color="#eaff62" intensity={2.4} distance={0.9} />
+        <pointLight color="#eaff62" intensity={2.4} distance={0.03} />
       </group>
     </>
   );
@@ -642,14 +652,14 @@ function CameraDirector({
       lastFocus.current = focusRequest;
       globePosition(selected, preciseNowSeconds(), predictive, 0, target);
       radial.copy(target).normalize();
-      camera.position.copy(target).addScaledVector(radial, 0.42);
+      camera.position.copy(target).addScaledVector(radial, 0.025);
       camera.lookAt(target);
     }
 
     if (follow && selected) {
       globePosition(selected, preciseNowSeconds(), predictive, 0, target);
       radial.copy(target).normalize();
-      desired.copy(target).addScaledVector(radial, 0.3);
+      desired.copy(target).addScaledVector(radial, 0.018);
       camera.position.lerp(desired, 0.065);
       camera.lookAt(target);
     }
@@ -706,7 +716,7 @@ function GlobeScene({
       <pointLight position={[-4, -1, -3]} intensity={2.1} color="#0a4f7c" />
       <Suspense fallback={null}><Earth /></Suspense>
       <AircraftFleet aircraft={aircraft} selectedId={selected?.id} predictive={predictive} onSelect={onSelect} />
-      {selected && <SelectedAircraft flight={selected} predictive={predictive} paths={paths} />}
+      {selected && <SelectedAircraft key={selected.id} flight={selected} predictive={predictive} paths={paths} />}
       <Stars radius={70} depth={38} count={2400} factor={2.1} saturation={0.25} fade speed={0.2} />
       <OrbitControls
         makeDefault={!flyMode}
@@ -716,7 +726,7 @@ function GlobeScene({
         rotateSpeed={0.48}
         zoomSpeed={0.72}
         panSpeed={0.65}
-        minDistance={0.04}
+        minDistance={0.0008}
         maxDistance={30}
         enablePan
         target={orbitTarget}
@@ -853,7 +863,7 @@ export function AirTrafficApp() {
   return (
     <main className="relative h-dvh w-full overflow-hidden bg-[#02070c] text-slate-100 selection:bg-cyan-300/25">
       <div className="absolute inset-0">
-        <Canvas camera={{ position: [0, 0.3, 6.7], fov: 43, near: 0.005, far: 150 }} dpr={[1, 1.65]} gl={{ antialias: true, powerPreference: 'high-performance' }}>
+        <Canvas camera={{ position: [0, 0.3, 6.7], fov: 43, near: 0.00001, far: 150 }} dpr={[1, 1.65]} gl={{ antialias: true, powerPreference: 'high-performance' }}>
           <GlobeScene
             aircraft={filteredAircraft}
             selected={selected}
@@ -1013,7 +1023,7 @@ export function AirTrafficApp() {
 
       <footer className="pointer-events-none absolute inset-x-0 bottom-0 z-30 flex h-10 items-center border-t border-white/[0.08] bg-[#030a10]/82 px-4 font-mono text-[9px] tracking-wider text-slate-600 backdrop-blur-xl sm:px-6">
         <span className="flex items-center gap-2"><Radio className={`size-3 ${feedState === 'live' ? 'text-cyan-300' : 'text-amber-300'}`} /> {feedState === 'live' ? 'OPENSKY LIVE NETWORK' : 'OPENSKY CONNECTION PENDING'}</span><span className="mx-4 hidden h-3 w-px bg-white/10 sm:block" /><span className="hidden sm:inline">UTC {utc}</span><span className="ml-4 hidden text-slate-700 xl:inline">EARTH / NASA BLUE MARBLE</span>
-        <div className="ml-auto flex items-center gap-4"><span className="hidden items-center gap-1.5 md:flex"><Activity className="size-3 text-lime-300" /> FLUID LIVE MOTION</span><span className="hidden items-center gap-1.5 xl:flex">{meta ? `${meta.refreshAfter}s SOURCE SYNC` : 'CONNECTING'}</span><span className="hidden items-center gap-1.5 lg:flex"><ArrowUpFromLine className="size-3" /> SPACE</span><span className="hidden items-center gap-1.5 lg:flex"><ArrowDownToLine className="size-3" /> CTRL</span><span className="flex items-center gap-1.5"><Gauge className="size-3" /> 60 FPS</span></div>
+        <div className="ml-auto flex items-center gap-4"><span className="hidden items-center gap-1.5 md:flex"><Activity className="size-3 text-lime-300" /> TRUE-SPEED LIVE MOTION</span><span className="hidden items-center gap-1.5 xl:flex">{meta ? `${meta.refreshAfter}s SOURCE SYNC` : 'CONNECTING'}</span><span className="hidden items-center gap-1.5 lg:flex"><ArrowUpFromLine className="size-3" /> SPACE</span><span className="hidden items-center gap-1.5 lg:flex"><ArrowDownToLine className="size-3" /> CTRL</span><span className="flex items-center gap-1.5"><Gauge className="size-3" /> 60 FPS</span></div>
       </footer>
     </main>
   );

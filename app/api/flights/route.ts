@@ -43,6 +43,7 @@ type FlightResponse = {
     speed: number;
     heading: number;
     verticalRate: number;
+    positionTime: number;
     lastContact: number;
     squawk: string | null;
     spi: boolean;
@@ -89,13 +90,16 @@ async function getToken() {
 export async function GET() {
   if (flightCache && flightCache.expiresAt > Date.now()) {
     return NextResponse.json(flightCache.body, {
-      headers: { 'x-skytrace-cache': 'hit' },
+      headers: {
+        'cache-control': 'private, no-store',
+        'x-skytrace-cache': 'hit',
+      },
     });
   }
 
   try {
     const token = await getToken();
-    const response = await fetch('https://opensky-network.org/api/states/all', {
+    const response = await fetch('https://opensky-network.org/api/states/all?extended=1', {
       headers: token ? { authorization: `Bearer ${token}` } : undefined,
       cache: 'no-store',
       signal: AbortSignal.timeout(22_000),
@@ -128,6 +132,7 @@ export async function GET() {
         speed: state[9] ?? 0,
         heading: state[10] ?? 0,
         verticalRate: state[11] ?? 0,
+        positionTime: state[3] ?? state[4],
         lastContact: state[4],
         squawk: state[14],
         spi: state[15],
@@ -154,7 +159,9 @@ export async function GET() {
 
     return NextResponse.json(body, {
       headers: {
-        'cache-control': `public, max-age=${refreshAfter}, stale-while-revalidate=60`,
+        // Always reach this worker so its controlled quota-aware cache decides
+        // freshness; a shared edge cache can otherwise freeze the same snapshot.
+        'cache-control': 'private, no-store',
         'x-skytrace-cache': 'miss',
       },
     });
