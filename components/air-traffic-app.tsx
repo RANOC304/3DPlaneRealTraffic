@@ -521,8 +521,11 @@ function tileLatitude(y: number, tileCount: number) {
 
 function buildMapTileGeometry(tile: MapTile) {
   const tileCount = 2 ** tile.zoom;
-  const segments = tile.zoom <= 4 ? 16 : tile.zoom <= 7 ? 8 : 3;
-  const radius = earthRadius + 0.0007;
+  // A tile is a flat triangle mesh draped over a curved sphere. Wide low-zoom
+  // triangles bow through the base globe unless their angular step stays small;
+  // that intersection was the repeated black-diamond pattern on the map.
+  const segments = Math.max(3, Math.ceil(360 / tileCount));
+  const radius = earthRadius + 0.001;
   const positions: number[] = [];
   const uvs: number[] = [];
   const indices: number[] = [];
