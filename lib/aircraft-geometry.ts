@@ -41,14 +41,17 @@ export type AircraftSurface =
   | 'engine' // nacelle cowls, bare metal
   | 'dark'; // fan faces, tyres, gear legs
 
-// Fallback colours used when the geometry is baked into the instanced fleet.
+// High-visibility yellow scheme, baked into the geometry for the instanced
+// fleet. The surfaces step down in value — body brightest, wings a shade
+// deeper, fin darkest — so an aircraft still reads as a shape from orbit
+// instead of a flat yellow blob.
 const surfaceColor: Record<AircraftSurface, string> = {
-  shell: '#f2f8fb',
-  wing: '#c9d8e0',
-  accent: '#1d5fa8',
-  glass: '#12222e',
-  engine: '#dbe6ec',
-  dark: '#20282d',
+  shell: '#ffd21e',
+  wing: '#f2ae05',
+  accent: '#b8630a',
+  glass: '#3a2a06',
+  engine: '#ffcb3f',
+  dark: '#4a3608',
 };
 
 type SurfaceParts = Map<AircraftSurface, BufferGeometry[]>;
@@ -897,14 +900,18 @@ export function createHeroAircraft(
 
 // Material presets shared by the close-up model, kept here so the shading stays
 // in step with the vertex colours baked into the fleet.
+// `glow` re-emits a fraction of the surface's own colour. The scene lights the
+// globe with a cold blue key, which would otherwise drag yellow toward olive;
+// self-lighting the bright panels holds the colour and lifts the aircraft off
+// bright terrain, while glass and tyres stay dark so the shape still reads.
 export const surfaceMaterial: Record<
   AircraftSurface,
-  { color: string; metalness: number; roughness: number }
+  { color: string; metalness: number; roughness: number; glow: number }
 > = {
-  shell: { color: '#f4fafd', metalness: 0.36, roughness: 0.26 },
-  wing: { color: '#cfdde5', metalness: 0.62, roughness: 0.3 },
-  accent: { color: '#1d5fa8', metalness: 0.3, roughness: 0.34 },
-  glass: { color: '#0d1c27', metalness: 0.9, roughness: 0.08 },
-  engine: { color: '#e3edf2', metalness: 0.72, roughness: 0.2 },
-  dark: { color: '#22292e', metalness: 0.55, roughness: 0.52 },
+  shell: { color: '#ffd21e', metalness: 0.34, roughness: 0.3, glow: 0.22 },
+  wing: { color: '#f2ae05', metalness: 0.5, roughness: 0.34, glow: 0.2 },
+  accent: { color: '#b8630a', metalness: 0.32, roughness: 0.36, glow: 0.22 },
+  glass: { color: '#241a04', metalness: 0.9, roughness: 0.08, glow: 0 },
+  engine: { color: '#ffcb3f', metalness: 0.6, roughness: 0.24, glow: 0.2 },
+  dark: { color: '#4a3608', metalness: 0.5, roughness: 0.5, glow: 0 },
 };

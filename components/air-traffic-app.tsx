@@ -49,6 +49,7 @@ import {
   Float32BufferAttribute,
   InstancedMesh,
   type MeshBasicMaterial,
+  MeshStandardMaterial,
   Object3D,
   PerspectiveCamera,
   Quaternion,
@@ -455,8 +456,8 @@ function useFlightRoute(flight: Aircraft | null) {
 type MapTile = { zoom: number; x: number; y: number; url: string };
 type MapView = { zoom: number; x: number; y: number };
 
-const mapTileTemplate = process.env.NEXT_PUBLIC_MAP_TILE_URL
-  ?? 'https://tile.openstreetmap.org/{z}/{x}/{y}.png';
+const mapTileTemplate = process.env.NEXT_PUBLIC_SATELLITE_TILE_URL
+  ?? 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}';
 
 function mapZoom(distance: number) {
   const altitude = Math.max(0, distance - earthRadius);
@@ -497,9 +498,6 @@ function mapTileUrl(zoom: number, x: number, y: number) {
 }
 
 function mapTilesForView(view: MapView): MapTile[] {
-  // Keep the whole-planet view photographic and uncluttered. Street-map tiles
-  // take over only once the camera is close enough for their labels to help.
-  if (view.zoom === 3) return [];
   const tileCount = 2 ** view.zoom;
   // A compact nine-by-nine window covers the visible surface at the chosen
   // zoom while still requesting only the area the person is actively viewing.
@@ -537,7 +535,7 @@ function buildMapTileGeometry(tile: MapTile) {
       const lon = ((tile.x + columnProgress) / tileCount) * 360 - 180;
       const position = latLonPosition(lat, lon, radius);
       positions.push(position.x, position.y, position.z);
-      // Raster-map images start at the north-west corner; Three.js UVs start at
+      // Satellite tiles start at the north-west corner; Three.js UVs start at
       // the lower-left, so the vertical coordinate is intentionally inverted.
       uvs.push(columnProgress, 1 - rowProgress);
     }
@@ -912,6 +910,34 @@ function aircraftVariant(category: number): AircraftVariant {
   return 'jet';
 }
 
+// The globe is lit by a cold blue key and a deep blue rim, which drags a yellow
+// airframe toward olive, and a plainly lit aircraft disappears over bright
+// desert or cloud. Feeding each surface's own baked colour back into the
+// emissive term makes the airframe partly self-lit: bright panels hold their
+// yellow and stand clear of any terrain, while glass, fan faces and tyres stay
+// dark, so the shape still reads instead of flattening into a blob.
+function useSelfLitFleetMaterial() {
+  const material = useMemo(() => {
+    const created = new MeshStandardMaterial({
+      vertexColors: true,
+      metalness: 0.36,
+      roughness: 0.4,
+    });
+    created.onBeforeCompile = (shader) => {
+      shader.uniforms.uSelfLit = { value: 0.5 };
+      shader.fragmentShader = shader.fragmentShader
+        .replace('#include <common>', 'uniform float uSelfLit;\n#include <common>')
+        .replace(
+          '#include <emissivemap_fragment>',
+          '#include <emissivemap_fragment>\n\ttotalEmissiveRadiance += vColor.rgb * uSelfLit;',
+        );
+    };
+    return created;
+  }, []);
+  useEffect(() => () => material.dispose(), [material]);
+  return material;
+}
+
 function AircraftInstances({
   aircraft,
   variant,
@@ -938,6 +964,7 @@ function AircraftInstances({
   const smoothedOrientations = useRef(new Map<string, Quaternion>());
   const geometry = useMemo(() => createFleetAircraftGeometry(variant), [variant]);
   useEffect(() => () => geometry.dispose(), [geometry]);
+  const material = useSelfLitFleetMaterial();
 
   const updateMatrices = useCallback((timestamp: number, delta: number) => {
     const mesh = ref.current;
@@ -1011,17 +1038,7 @@ function AircraftInstances({
       onPointerOut={() => { document.body.style.cursor = 'default'; }}
     >
       <primitive object={geometry} attach="geometry" />
-      {/* The geometry carries the high-visibility yellow scheme as vertex
-          colours — bright body, deeper wings, dark fin and fan faces — so one
-          instanced draw call still reads as an aircraft rather than a blob.
-          The warm emissive keeps traffic glowing on Earth's night side. */}
-      <meshStandardMaterial
-        vertexColors
-        emissive="#7a5200"
-        emissiveIntensity={0.4}
-        metalness={0.4}
-        roughness={0.36}
-      />
+      <primitive object={material} attach="material" />
     </instancedMesh>
   );
 }
@@ -1071,6 +1088,8 @@ function SpinningAssembly({ part }: { part: SpinningPart }) {
         <primitive object={part.geometry} attach="geometry" />
         <meshStandardMaterial
           color={preset.color}
+          emissive={preset.color}
+          emissiveIntensity={preset.glow}
           metalness={preset.metalness}
           roughness={preset.roughness}
         />
@@ -1108,6 +1127,8 @@ function DetailedAircraftModel({
             <primitive object={geometry} attach="geometry" />
             <meshStandardMaterial
               color={surface === 'accent' ? accentColor : preset.color}
+              emissive={surface === 'accent' ? accentColor : preset.color}
+              emissiveIntensity={preset.glow}
               metalness={preset.metalness}
               roughness={preset.roughness}
               polygonOffset={decal}
@@ -2086,16 +2107,16 @@ export function AirTrafficApp() {
       <div className="pointer-events-none absolute bottom-[56px] right-3 hidden border border-white/[0.08] bg-[#061018]/72 px-3 py-2 font-mono text-[8px] tracking-wider text-slate-600 backdrop-blur-xl xl:block"><span className="mr-3 text-slate-500">CAMERA XYZ</span>{cameraPosition.map((axis, index) => <span key={index} className="ml-2"><span className="text-cyan-300/60">{['X', 'Y', 'Z'][index]}</span> {axis.toFixed(2)}</span>)}</div>
 
       <a
-        href="https://www.openstreetmap.org/copyright"
+        href="https://www.arcgis.com/home/item.html?id=10df2279f9684e4a9f6a7f08febac2a9"
         target="_blank"
         rel="noreferrer"
         className="pointer-events-auto absolute bottom-[46px] right-2 z-30 border border-white/[0.08] bg-[#061018]/82 px-2 py-1 font-mono text-[8px] tracking-wide text-slate-400 backdrop-blur-md transition hover:text-cyan-200 sm:right-3"
       >
-        © OpenStreetMap contributors
+        Imagery © Esri, Vantor, Earthstar Geographics, GIS User Community
       </a>
 
       <footer className="pointer-events-none absolute inset-x-0 bottom-0 z-30 flex h-10 items-center border-t border-white/[0.08] bg-[#030a10]/82 px-4 font-mono text-[9px] tracking-wider text-slate-600 backdrop-blur-xl sm:px-6">
-        <span className="flex items-center gap-2"><Radio className={`size-3 ${feedState === 'live' ? 'text-cyan-300' : 'text-amber-300'}`} /> {feedState === 'live' ? 'OPENSKY LIVE NETWORK' : 'OPENSKY CONNECTION PENDING'}</span><span className="mx-4 hidden h-3 w-px bg-white/10 sm:block" /><span className="hidden sm:inline">UTC {utc}</span><span className="ml-4 hidden text-slate-700 xl:inline">EARTH / NASA + LIVE MAP TILES</span>
+        <span className="flex items-center gap-2"><Radio className={`size-3 ${feedState === 'live' ? 'text-cyan-300' : 'text-amber-300'}`} /> {feedState === 'live' ? 'OPENSKY LIVE NETWORK' : 'OPENSKY CONNECTION PENDING'}</span><span className="mx-4 hidden h-3 w-px bg-white/10 sm:block" /><span className="hidden sm:inline">UTC {utc}</span><span className="ml-4 hidden text-slate-700 xl:inline">EARTH / SATELLITE IMAGERY</span>
         <div className="ml-auto flex items-center gap-4"><span className="hidden items-center gap-1.5 md:flex"><Activity className="size-3 text-lime-300" /> {motionSpeed[0] === 1 ? 'TRUE-SPEED LIVE MOTION' : `${motionSpeed[0]}× TIME-LAPSE MOTION`}</span><span className="hidden items-center gap-1.5 xl:flex">{meta ? `${meta.refreshAfter}s SOURCE SYNC` : 'CONNECTING'}</span><span className="hidden items-center gap-1.5 lg:flex"><ArrowUpFromLine className="size-3" /> SPACE</span><span className="hidden items-center gap-1.5 lg:flex"><ArrowDownToLine className="size-3" /> CTRL</span><span className="flex items-center gap-1.5"><Gauge className="size-3" /> 60 FPS</span></div>
       </footer>
     </main>

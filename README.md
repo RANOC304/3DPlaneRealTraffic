@@ -31,4 +31,4 @@ NEXT_PUBLIC_SITE_URL=http://localhost:3000
 
 OpenSky is free and keyless at its anonymous tier, but it is a community receiver network—not a certified, complete registry of every aircraft worldwide. Some aircraft, regions, registrations, routes, and airport details may be missing. Skytrace shows the complete set of position-bearing states returned by the current OpenSky snapshot and clearly switches to preview data if the live source is unavailable.
 
-The whole-Earth base uses NASA Blue Marble imagery. As you zoom, the globe loads only the visible OpenStreetMap tiles at progressively finer zoom levels so roads, cities, and place names stay sharp. Aircraft state vectors are provided by the OpenSky Network.
+The whole-Earth base uses NASA Blue Marble imagery, with progressively finer Esri World Imagery satellite tiles loaded for only the visible area as the camera moves and zooms. The globe stays photographic at every scale instead of switching to a street-map style. Aircraft state vectors are provided by the OpenSky Network.
