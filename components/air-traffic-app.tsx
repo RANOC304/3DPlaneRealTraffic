@@ -89,6 +89,7 @@ type FeedState = 'connecting' | 'live' | 'preview';
 type FlightStateFilter = 'airborne' | 'ground' | 'all';
 
 const nowSeconds = () => Math.floor(Date.now() / 1000);
+const preciseNowSeconds = () => Date.now() / 1000;
 const formatNumber = (value: number) => Math.round(value).toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',');
 
 const previewFlights: Aircraft[] = [
@@ -156,7 +157,7 @@ const upVector = new Vector3(0, 1, 0);
 function predictCoordinates(flight: Aircraft, timestamp: number, extraSeconds = 0) {
   if (flight.onGround || flight.speed <= 0) return { lat: flight.lat, lon: flight.lon };
 
-  const seconds = Math.max(-900, Math.min(900, timestamp - flight.lastContact + extraSeconds));
+  const seconds = predictionSeconds(flight, timestamp, extraSeconds);
   const angularDistance = (flight.speed * seconds) / 1000 / earthKilometers;
   const heading = flight.heading * (Math.PI / 180);
   const latitude = flight.lat * (Math.PI / 180);
@@ -166,15 +167,28 @@ function predictCoordinates(flight: Aircraft, timestamp: number, extraSeconds = 
   return { lat: Math.max(-89.9, Math.min(89.9, lat)), lon: ((lon + 540) % 360) - 180 };
 }
 
-function globePosition(flight: Aircraft, timestamp: number, predictive: boolean, extraSeconds = 0) {
+function predictionSeconds(flight: Aircraft, timestamp: number, extraSeconds = 0) {
+  return Math.max(-900, Math.min(900, timestamp - flight.lastContact + extraSeconds));
+}
+
+function globePosition(
+  flight: Aircraft,
+  timestamp: number,
+  predictive: boolean,
+  extraSeconds = 0,
+  target = new Vector3(),
+) {
   const coords = predictive
     ? predictCoordinates(flight, timestamp, extraSeconds)
     : { lat: flight.lat, lon: flight.lon };
-  const altitudeOffset = flight.onGround ? 0.006 : Math.min(0.075, Math.max(0.014, flight.altitude / 260000));
+  const projectedAltitude = predictive
+    ? Math.max(0, flight.altitude + flight.verticalRate * predictionSeconds(flight, timestamp, extraSeconds))
+    : flight.altitude;
+  const altitudeOffset = flight.onGround ? 0.006 : Math.min(0.075, Math.max(0.014, projectedAltitude / 260000));
   const radius = earthRadius + altitudeOffset;
   const phi = (90 - coords.lat) * (Math.PI / 180);
   const theta = (coords.lon + 180) * (Math.PI / 180);
-  return new Vector3(
+  return target.set(
     -radius * Math.sin(phi) * Math.cos(theta),
     radius * Math.cos(phi),
     radius * Math.sin(phi) * Math.sin(theta),
@@ -328,38 +342,62 @@ function AircraftInstances({
   const orientation = useMemo(() => new Quaternion(), []);
   const radial = useMemo(() => new Vector3(), []);
   const headingRotation = useMemo(() => new Quaternion(), []);
+  const targetPosition = useMemo(() => new Vector3(), []);
+  const smoothedPositions = useRef(new Map<string, Vector3>());
+  const smoothedOrientations = useRef(new Map<string, Quaternion>());
   const geometry = useMemo(() => createFleetAircraftGeometry(variant), [variant]);
-  const lastUpdate = useRef(0);
 
-  const updateMatrices = useCallback((timestamp: number) => {
+  const updateMatrices = useCallback((timestamp: number, delta: number) => {
     const mesh = ref.current;
     if (!mesh) return;
+    const blend = 1 - Math.exp(-Math.min(delta, 0.1) * 7.5);
     aircraft.forEach((flight, index) => {
-      const position = globePosition(flight, timestamp, predictive);
-      radial.copy(position).normalize();
+      globePosition(flight, timestamp, predictive, 0, targetPosition);
+      let position = smoothedPositions.current.get(flight.id);
+      if (!position) {
+        position = targetPosition.clone();
+        smoothedPositions.current.set(flight.id, position);
+      } else {
+        position.lerp(targetPosition, blend);
+      }
+      radial.copy(targetPosition).normalize();
       orientation.setFromUnitVectors(upVector, radial);
       headingRotation.setFromAxisAngle(radial, -flight.heading * (Math.PI / 180));
       orientation.premultiply(headingRotation);
+      let smoothOrientation = smoothedOrientations.current.get(flight.id);
+      if (!smoothOrientation) {
+        smoothOrientation = orientation.clone();
+        smoothedOrientations.current.set(flight.id, smoothOrientation);
+      } else {
+        smoothOrientation.slerp(orientation, blend);
+      }
       dummy.position.copy(position);
-      dummy.quaternion.copy(orientation);
+      dummy.quaternion.copy(smoothOrientation);
       const scale = flight.id === selectedId ? 1.3 : flight.onGround ? 0.78 : 1;
       dummy.scale.setScalar(scale);
       dummy.updateMatrix();
       mesh.setMatrixAt(index, dummy.matrix);
     });
     mesh.instanceMatrix.needsUpdate = true;
-  }, [aircraft, dummy, headingRotation, orientation, predictive, radial, selectedId]);
+  }, [aircraft, dummy, headingRotation, orientation, predictive, radial, selectedId, targetPosition]);
+
+  useEffect(() => {
+    const visibleIds = new Set(aircraft.map((flight) => flight.id));
+    smoothedPositions.current.forEach((_, id) => {
+      if (!visibleIds.has(id)) smoothedPositions.current.delete(id);
+    });
+    smoothedOrientations.current.forEach((_, id) => {
+      if (!visibleIds.has(id)) smoothedOrientations.current.delete(id);
+    });
+  }, [aircraft]);
 
   useLayoutEffect(() => {
     if (ref.current) ref.current.instanceMatrix.setUsage(DynamicDrawUsage);
-    updateMatrices(nowSeconds());
+    updateMatrices(preciseNowSeconds(), 1);
   }, [updateMatrices]);
 
-  useFrame(() => {
-    const now = performance.now();
-    if (now - lastUpdate.current < 220) return;
-    lastUpdate.current = now;
-    updateMatrices(nowSeconds());
+  useFrame((_, delta) => {
+    updateMatrices(preciseNowSeconds(), delta);
   });
 
   return (
@@ -493,20 +531,28 @@ function SelectedAircraft({ flight, predictive, paths }: { flight: Aircraft; pre
   const radial = useMemo(() => new Vector3(), []);
   const quaternion = useMemo(() => new Quaternion(), []);
   const headingRotation = useMemo(() => new Quaternion(), []);
+  const initialized = useRef(false);
   const trail = useMemo(() => {
     const time = nowSeconds();
     return [-360, -240, -120, 0, 120, 240, 360, 480].map((offset) => globePosition(flight, time, true, offset));
   }, [flight]);
 
-  useFrame(() => {
+  useFrame((_, delta) => {
     if (!group.current) return;
-    position.copy(globePosition(flight, nowSeconds(), predictive));
+    globePosition(flight, preciseNowSeconds(), predictive, 0, position);
     radial.copy(position).normalize();
     quaternion.setFromUnitVectors(upVector, radial);
     headingRotation.setFromAxisAngle(radial, -flight.heading * (Math.PI / 180));
     quaternion.premultiply(headingRotation);
-    group.current.position.copy(position);
-    group.current.quaternion.copy(quaternion);
+    if (!initialized.current) {
+      group.current.position.copy(position);
+      group.current.quaternion.copy(quaternion);
+      initialized.current = true;
+      return;
+    }
+    const blend = 1 - Math.exp(-Math.min(delta, 0.1) * 8);
+    group.current.position.lerp(position, blend);
+    group.current.quaternion.slerp(quaternion, blend);
   });
 
   return (
@@ -594,14 +640,14 @@ function CameraDirector({
 
     if (selected && lastFocus.current !== focusRequest) {
       lastFocus.current = focusRequest;
-      target.copy(globePosition(selected, nowSeconds(), predictive));
+      globePosition(selected, preciseNowSeconds(), predictive, 0, target);
       radial.copy(target).normalize();
       camera.position.copy(target).addScaledVector(radial, 0.42);
       camera.lookAt(target);
     }
 
     if (follow && selected) {
-      target.copy(globePosition(selected, nowSeconds(), predictive));
+      globePosition(selected, preciseNowSeconds(), predictive, 0, target);
       radial.copy(target).normalize();
       desired.copy(target).addScaledVector(radial, 0.3);
       camera.position.lerp(desired, 0.065);
@@ -734,6 +780,13 @@ export function AirTrafficApp() {
   }, []);
 
   useEffect(() => {
+    setSelected((current) => {
+      if (!current) return null;
+      return aircraft.find((flight) => flight.id === current.id) ?? current;
+    });
+  }, [aircraft]);
+
+  useEffect(() => {
     const shortcut = (event: KeyboardEvent) => {
       if (event.key === '/' && document.pointerLockElement === null) {
         event.preventDefault();
@@ -777,7 +830,7 @@ export function AirTrafficApp() {
   const centerSelected = () => {
     if (!selected) return;
     setFollow(false);
-    const target = globePosition(selected, nowSeconds(), predictive);
+    const target = globePosition(selected, preciseNowSeconds(), predictive);
     setOrbitTarget([target.x, target.y, target.z]);
     setFocusRequest((value) => value + 1);
   };
@@ -960,7 +1013,7 @@ export function AirTrafficApp() {
 
       <footer className="pointer-events-none absolute inset-x-0 bottom-0 z-30 flex h-10 items-center border-t border-white/[0.08] bg-[#030a10]/82 px-4 font-mono text-[9px] tracking-wider text-slate-600 backdrop-blur-xl sm:px-6">
         <span className="flex items-center gap-2"><Radio className={`size-3 ${feedState === 'live' ? 'text-cyan-300' : 'text-amber-300'}`} /> {feedState === 'live' ? 'OPENSKY LIVE NETWORK' : 'OPENSKY CONNECTION PENDING'}</span><span className="mx-4 hidden h-3 w-px bg-white/10 sm:block" /><span className="hidden sm:inline">UTC {utc}</span><span className="ml-4 hidden text-slate-700 xl:inline">EARTH / NASA BLUE MARBLE</span>
-        <div className="ml-auto flex items-center gap-4"><span className="hidden items-center gap-1.5 md:flex"><Activity className="size-3" /> {meta ? `${meta.refreshAfter}s REFRESH` : 'CONNECTING'}</span><span className="hidden items-center gap-1.5 lg:flex"><ArrowUpFromLine className="size-3" /> SPACE</span><span className="hidden items-center gap-1.5 lg:flex"><ArrowDownToLine className="size-3" /> CTRL</span><span className="flex items-center gap-1.5"><Gauge className="size-3" /> WEBGL</span></div>
+        <div className="ml-auto flex items-center gap-4"><span className="hidden items-center gap-1.5 md:flex"><Activity className="size-3 text-lime-300" /> FLUID LIVE MOTION</span><span className="hidden items-center gap-1.5 xl:flex">{meta ? `${meta.refreshAfter}s SOURCE SYNC` : 'CONNECTING'}</span><span className="hidden items-center gap-1.5 lg:flex"><ArrowUpFromLine className="size-3" /> SPACE</span><span className="hidden items-center gap-1.5 lg:flex"><ArrowDownToLine className="size-3" /> CTRL</span><span className="flex items-center gap-1.5"><Gauge className="size-3" /> 60 FPS</span></div>
       </footer>
     </main>
   );

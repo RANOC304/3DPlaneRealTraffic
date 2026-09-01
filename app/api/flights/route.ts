@@ -137,7 +137,9 @@ export async function GET() {
     });
 
     const authenticated = Boolean(token);
-    const refreshAfter = authenticated ? 60 : 900;
+    // A global snapshot costs four credits. Ninety seconds stays below the
+    // free authenticated daily allowance while anonymous mode needs 15 minutes.
+    const refreshAfter = authenticated ? 90 : 900;
     const body: FlightResponse = {
       source: 'opensky',
       mode: authenticated ? 'authenticated' : 'anonymous',

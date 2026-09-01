@@ -11,7 +11,7 @@ npm run dev
 
 Open `http://localhost:3000`.
 
-No API credentials are required for the basic experience. Anonymous OpenSky requests are cached for 15 minutes to stay inside the free global-request allowance. For a more frequent 60-second refresh, create a free OpenSky API client and copy `.env.example` to `.env.local`:
+No API credentials are required for the basic experience. Anonymous OpenSky requests are cached for 15 minutes to stay inside the free global-request allowance. Aircraft still move continuously at 60 FPS between snapshots using their real speed, heading, climb rate, and last-contact time. For a sustainable 90-second source refresh, create a free OpenSky API client and copy `.env.example` to `.env.local`:
 
 ```env
 OPENSKY_CLIENT_ID=your_client_id
