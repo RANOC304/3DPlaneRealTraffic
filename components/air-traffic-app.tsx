@@ -1,7 +1,7 @@
 'use client';
 
 import { Canvas, type ThreeEvent, useFrame, useThree } from '@react-three/fiber';
-import { Line, OrbitControls, PointerLockControls, Stars, useTexture } from '@react-three/drei';
+import { Line, OrbitControls, Stars, useTexture } from '@react-three/drei';
 import {
   Activity,
   AlertTriangle,
@@ -41,8 +41,8 @@ import {
   ConeGeometry,
   CylinderGeometry,
   DynamicDrawUsage,
-  Euler,
   InstancedMesh,
+  Matrix4,
   Object3D,
   Quaternion,
   SRGBColorSpace,
@@ -570,12 +570,66 @@ function SelectedAircraft({ flight, predictive, paths }: { flight: Aircraft; pre
   );
 }
 
+function PlanetPointerLockControls({ onLockChange }: { onLockChange: (active: boolean) => void }) {
+  const { camera, gl } = useThree();
+  const radialUp = useMemo(() => new Vector3(), []);
+  const forward = useMemo(() => new Vector3(), []);
+  const candidate = useMemo(() => new Vector3(), []);
+  const right = useMemo(() => new Vector3(), []);
+  const lookTarget = useMemo(() => new Vector3(), []);
+  const yaw = useMemo(() => new Quaternion(), []);
+
+  useEffect(() => {
+    const requestLock = (event: MouseEvent) => {
+      if (event.target instanceof Element && event.target.closest('#fly-mode-button') && document.pointerLockElement !== gl.domElement) {
+        void gl.domElement.requestPointerLock();
+      }
+    };
+    const lockChanged = () => onLockChange(document.pointerLockElement === gl.domElement);
+    const look = (event: MouseEvent) => {
+      if (document.pointerLockElement !== gl.domElement) return;
+
+      radialUp.copy(camera.position).normalize();
+      camera.getWorldDirection(forward).normalize();
+
+      yaw.setFromAxisAngle(radialUp, -event.movementX * 0.0018);
+      forward.applyQuaternion(yaw).normalize();
+      right.crossVectors(forward, radialUp);
+      if (right.lengthSq() < 0.000001) right.setFromMatrixColumn(camera.matrix, 0);
+      right.normalize();
+
+      candidate.copy(forward).applyAxisAngle(right, -event.movementY * 0.0018).normalize();
+      if (Math.abs(candidate.dot(radialUp)) < 0.988) forward.copy(candidate);
+
+      camera.up.copy(radialUp);
+      lookTarget.copy(camera.position).add(forward);
+      camera.lookAt(lookTarget);
+    };
+
+    document.addEventListener('click', requestLock);
+    document.addEventListener('pointerlockchange', lockChanged);
+    document.addEventListener('mousemove', look);
+    return () => {
+      document.removeEventListener('click', requestLock);
+      document.removeEventListener('pointerlockchange', lockChanged);
+      document.removeEventListener('mousemove', look);
+    };
+  }, [camera, candidate, forward, gl.domElement, lookTarget, onLockChange, radialUp, right, yaw]);
+
+  return null;
+}
+
 function FlyMovement({ active, speed }: { active: boolean; speed: number }) {
   const { camera } = useThree();
   const keys = useRef(new Set<string>());
   const forward = useMemo(() => new Vector3(), []);
+  const tangentForward = useMemo(() => new Vector3(), []);
   const right = useMemo(() => new Vector3(), []);
-  const localUp = useMemo(() => new Vector3(), []);
+  const gravityUp = useMemo(() => new Vector3(), []);
+  const correctedUp = useMemo(() => new Vector3(), []);
+  const back = useMemo(() => new Vector3(), []);
+  const targetQuaternion = useMemo(() => new Quaternion(), []);
+  const gravityBasis = useMemo(() => new Matrix4(), []);
 
   useEffect(() => {
     const down = (event: KeyboardEvent) => keys.current.add(event.code);
@@ -593,16 +647,42 @@ function FlyMovement({ active, speed }: { active: boolean; speed: number }) {
     if (!active) return;
     const held = keys.current;
     const amount = delta * speed * (held.has('ShiftLeft') || held.has('ShiftRight') ? 3.2 : 1);
+    const startingRadius = camera.position.length();
+    gravityUp.copy(camera.position).normalize();
     camera.getWorldDirection(forward).normalize();
-    right.crossVectors(forward, camera.up).normalize();
-    localUp.crossVectors(right, forward).normalize();
+    tangentForward.copy(forward).addScaledVector(gravityUp, -forward.dot(gravityUp));
+    if (tangentForward.lengthSq() < 0.000001) {
+      right.setFromMatrixColumn(camera.matrix, 0).normalize();
+      tangentForward.crossVectors(gravityUp, right).normalize();
+    } else {
+      tangentForward.normalize();
+      right.crossVectors(tangentForward, gravityUp).normalize();
+    }
 
-    if (held.has('KeyZ') || held.has('KeyW') || held.has('ArrowUp')) camera.position.addScaledVector(forward, amount);
-    if (held.has('KeyS') || held.has('ArrowDown')) camera.position.addScaledVector(forward, -amount);
+    if (held.has('KeyZ') || held.has('KeyW') || held.has('ArrowUp')) camera.position.addScaledVector(tangentForward, amount);
+    if (held.has('KeyS') || held.has('ArrowDown')) camera.position.addScaledVector(tangentForward, -amount);
     if (held.has('KeyQ') || held.has('KeyA') || held.has('ArrowLeft')) camera.position.addScaledVector(right, -amount);
     if (held.has('KeyD') || held.has('ArrowRight')) camera.position.addScaledVector(right, amount);
-    if (held.has('Space') || held.has('KeyR') || held.has('KeyE')) camera.position.addScaledVector(localUp, amount);
-    if (held.has('ControlLeft') || held.has('ControlRight') || held.has('KeyF') || held.has('KeyC')) camera.position.addScaledVector(localUp, -amount);
+    const outward = held.has('Space') || held.has('KeyR') || held.has('KeyE');
+    const inward = held.has('ControlLeft') || held.has('ControlRight') || held.has('KeyF') || held.has('KeyC');
+    const nextRadius = Math.max(earthRadius + 0.035, startingRadius + (outward ? amount : 0) - (inward ? amount : 0));
+    camera.position.normalize().multiplyScalar(nextRadius);
+
+    gravityUp.copy(camera.position).normalize();
+    camera.getWorldDirection(forward).normalize();
+    right.crossVectors(forward, gravityUp);
+    if (right.lengthSq() > 0.000001) {
+      right.normalize();
+      correctedUp.crossVectors(right, forward).normalize();
+      back.copy(forward).multiplyScalar(-1);
+      gravityBasis.makeBasis(right, correctedUp, back);
+      targetQuaternion.setFromRotationMatrix(gravityBasis);
+      const gravityBlend = 1 - Math.exp(-Math.min(delta, 0.1) * 8);
+      camera.quaternion.slerp(targetQuaternion, gravityBlend);
+      camera.up.lerp(gravityUp, gravityBlend).normalize();
+    } else {
+      camera.up.copy(gravityUp);
+    }
   });
 
   return null;
@@ -721,12 +801,7 @@ function GlobeScene({
         enablePan
         target={orbitTarget}
       />
-      <PointerLockControls
-        selector="#fly-mode-button"
-        pointerSpeed={0.55}
-        onLock={() => onFlyMode(true)}
-        onUnlock={() => onFlyMode(false)}
-      />
+      <PlanetPointerLockControls onLockChange={onFlyMode} />
       <FlyMovement active={flyMode} speed={speed} />
       <CameraDirector selected={selected} predictive={predictive} follow={follow} focusRequest={focusRequest} resetRequest={resetRequest} onPosition={onPosition} />
     </>
@@ -926,11 +1001,11 @@ export function AirTrafficApp() {
       {helpOpen && (
         <div className="pointer-events-auto absolute right-4 top-[78px] z-30 w-[300px] border border-cyan-300/20 bg-[#061018]/95 p-4 shadow-2xl backdrop-blur-xl sm:right-6">
           <div className="flex items-center"><Navigation className="mr-2 size-4 text-cyan-300" /><h2 className="text-[11px] font-semibold tracking-[0.15em]">FREE-FLIGHT CONTROLS</h2><button onClick={() => setHelpOpen(false)} className="ml-auto text-slate-500 hover:text-white"><X className="size-4" /></button></div>
-          <p className="mt-3 text-xs leading-5 text-slate-400">Select <span className="text-cyan-200">FLY</span>, then use the mouse to look anywhere. Press Esc to release the mouse.</p>
+          <p className="mt-3 text-xs leading-5 text-slate-400">Select <span className="text-cyan-200">FLY</span>, then use the mouse to look anywhere. Earth gravity keeps the horizon beneath you as you travel around the globe. Press Esc to release the mouse.</p>
           <div className="mt-4 grid grid-cols-[1fr_auto] gap-y-3 text-[11px] text-slate-400">
             <span>Forward / back</span><span className="flex gap-1"><Key>Z/W</Key><Key>S</Key><Key>↑↓</Key></span>
             <span>Left / right</span><span className="flex gap-1"><Key>Q/A</Key><Key>D</Key><Key>←→</Key></span>
-            <span>Rise / descend</span><span className="flex gap-1"><Key>SPACE</Key><Key>CTRL</Key></span>
+            <span>Away / toward Earth</span><span className="flex gap-1"><Key>SPACE</Key><Key>CTRL</Key></span>
             <span>Move faster</span><span className="flex gap-1"><Key>SHIFT</Key></span>
           </div>
           <div className="mt-4 border-t border-white/[0.08] pt-3"><div className="mb-2 flex justify-between"><span className="telemetry-label">Flight speed</span><span className="font-mono text-[9px] text-cyan-200">{flySpeed[0].toFixed(2)} u/s</span></div><Slider min={0.15} max={2.5} step={0.05} value={flySpeed} onValueChange={(value) => setFlySpeed(value as number[])} /></div>
@@ -1006,14 +1081,14 @@ export function AirTrafficApp() {
       </div>
 
       {flyMode && (
-        <div className="pointer-events-none absolute left-1/2 top-[84px] z-20 -translate-x-1/2 border border-cyan-300/25 bg-[#041018]/75 px-4 py-2 text-center backdrop-blur-xl"><p className="font-mono text-[9px] tracking-[0.18em] text-cyan-200">FREE FLIGHT ACTIVE</p><p className="mt-1 font-mono text-[8px] tracking-wider text-slate-500">ZQSD / WASD / ARROWS · SPACE/CTRL · MOUSE · ESC TO RELEASE</p></div>
+        <div className="pointer-events-none absolute left-1/2 top-[84px] z-20 -translate-x-1/2 border border-cyan-300/25 bg-[#041018]/75 px-4 py-2 text-center backdrop-blur-xl"><p className="font-mono text-[9px] tracking-[0.18em] text-cyan-200">EARTH-GRAVITY FLIGHT ACTIVE</p><p className="mt-1 font-mono text-[8px] tracking-wider text-slate-500">ZQSD / WASD / ARROWS · SPACE OUT · CTRL IN · MOUSE · ESC TO RELEASE</p></div>
       )}
 
       <div className="pointer-events-none absolute bottom-[56px] right-3 hidden border border-white/[0.08] bg-[#061018]/72 px-3 py-2 font-mono text-[8px] tracking-wider text-slate-600 backdrop-blur-xl xl:block"><span className="mr-3 text-slate-500">CAMERA XYZ</span>{cameraPosition.map((axis, index) => <span key={index} className="ml-2"><span className="text-cyan-300/60">{['X', 'Y', 'Z'][index]}</span> {axis.toFixed(2)}</span>)}</div>
 
       <footer className="pointer-events-none absolute inset-x-0 bottom-0 z-30 flex h-10 items-center border-t border-white/[0.08] bg-[#030a10]/82 px-4 font-mono text-[9px] tracking-wider text-slate-600 backdrop-blur-xl sm:px-6">
         <span className="flex items-center gap-2"><Radio className={`size-3 ${feedState === 'live' ? 'text-cyan-300' : 'text-amber-300'}`} /> {feedState === 'live' ? 'OPENSKY LIVE NETWORK' : 'OPENSKY CONNECTION PENDING'}</span><span className="mx-4 hidden h-3 w-px bg-white/10 sm:block" /><span className="hidden sm:inline">UTC {utc}</span><span className="ml-4 hidden text-slate-700 xl:inline">EARTH / NASA BLUE MARBLE</span>
-        <div className="ml-auto flex items-center gap-4"><span className="hidden items-center gap-1.5 md:flex"><Activity className="size-3 text-lime-300" /> FLUID LIVE MOTION</span><span className="hidden items-center gap-1.5 xl:flex">{meta ? `${meta.refreshAfter}s SOURCE SYNC` : 'CONNECTING'}</span><span className="hidden items-center gap-1.5 lg:flex"><ArrowUpFromLine className="size-3" /> SPACE</span><span className="hidden items-center gap-1.5 lg:flex"><ArrowDownToLine className="size-3" /> CTRL</span><span className="flex items-center gap-1.5"><Gauge className="size-3" /> 60 FPS</span></div>
+        <div className="ml-auto flex items-center gap-4"><span className="hidden items-center gap-1.5 md:flex"><Activity className="size-3 text-lime-300" /> FLUID LIVE MOTION</span><span className="hidden items-center gap-1.5 xl:flex">{meta ? `${meta.refreshAfter}s SOURCE SYNC` : 'CONNECTING'}</span><span className="hidden items-center gap-1.5 lg:flex"><ArrowUpFromLine className="size-3" /> SPACE OUT</span><span className="hidden items-center gap-1.5 lg:flex"><ArrowDownToLine className="size-3" /> CTRL IN</span><span className="flex items-center gap-1.5"><Gauge className="size-3" /> 60 FPS</span></div>
       </footer>
     </main>
   );
