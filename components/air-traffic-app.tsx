@@ -48,6 +48,7 @@ import {
   Euler,
   Float32BufferAttribute,
   InstancedMesh,
+  type MeshBasicMaterial,
   Object3D,
   PerspectiveCamera,
   Quaternion,
@@ -496,6 +497,9 @@ function mapTileUrl(zoom: number, x: number, y: number) {
 }
 
 function mapTilesForView(view: MapView): MapTile[] {
+  // Keep the whole-planet view photographic and uncluttered. Street-map tiles
+  // take over only once the camera is close enough for their labels to help.
+  if (view.zoom === 3) return [];
   const tileCount = 2 ** view.zoom;
   // A compact nine-by-nine window covers the visible surface at the chosen
   // zoom while still requesting only the area the person is actively viewing.
@@ -520,7 +524,7 @@ function tileLatitude(y: number, tileCount: number) {
 function buildMapTileGeometry(tile: MapTile) {
   const tileCount = 2 ** tile.zoom;
   const segments = tile.zoom <= 4 ? 16 : tile.zoom <= 7 ? 8 : 3;
-  const radius = earthRadius + 0.0014;
+  const radius = earthRadius + 0.0007;
   const positions: number[] = [];
   const uvs: number[] = [];
   const indices: number[] = [];
@@ -594,7 +598,13 @@ function DetailedMapTile({ tile }: { tile: MapTile }) {
   if (!texture) return null;
   return (
     <mesh geometry={geometry} renderOrder={1}>
-      <meshBasicMaterial map={texture} toneMapped={false} />
+      <meshBasicMaterial
+        map={texture}
+        toneMapped={false}
+        polygonOffset
+        polygonOffsetFactor={-1}
+        polygonOffsetUnits={-1}
+      />
     </mesh>
   );
 }
@@ -618,6 +628,34 @@ function DetailedEarthMap() {
   return <>{tiles.map((tile) => <DetailedMapTile key={`${tile.zoom}/${tile.x}/${tile.y}`} tile={tile} />)}</>;
 }
 
+function Atmosphere() {
+  const { camera } = useThree();
+  const inner = useRef<MeshBasicMaterial>(null);
+  const outer = useRef<MeshBasicMaterial>(null);
+
+  useFrame(() => {
+    // The orbital glow looks good from space, but a back-faced atmosphere shell
+    // becomes a cyan pane over the entire map after the camera flies inside it.
+    // Fade it away before low-altitude map detail becomes visible.
+    const visibility = Math.max(0, Math.min(1, (camera.position.length() - 2.72) / 0.68));
+    if (inner.current) inner.current.opacity = 0.095 * visibility;
+    if (outer.current) outer.current.opacity = 0.028 * visibility;
+  });
+
+  return (
+    <>
+      <mesh>
+        <sphereGeometry args={[earthRadius + 0.055, 64, 64]} />
+        <meshBasicMaterial ref={inner} color="#55dcff" transparent opacity={0.095} side={BackSide} depthWrite={false} />
+      </mesh>
+      <mesh>
+        <sphereGeometry args={[earthRadius + 0.13, 64, 64]} />
+        <meshBasicMaterial ref={outer} color="#3dbfe8" transparent opacity={0.028} side={BackSide} depthWrite={false} />
+      </mesh>
+    </>
+  );
+}
+
 function Earth() {
   const { gl } = useThree();
   const texture = useTexture('/earth-day.jpg');
@@ -631,14 +669,7 @@ function Earth() {
         <meshStandardMaterial map={texture} roughness={0.9} metalness={0.02} />
       </mesh>
       <DetailedEarthMap />
-      <mesh>
-        <sphereGeometry args={[earthRadius + 0.055, 64, 64]} />
-        <meshBasicMaterial color="#55dcff" transparent opacity={0.095} side={BackSide} depthWrite={false} />
-      </mesh>
-      <mesh>
-        <sphereGeometry args={[earthRadius + 0.13, 64, 64]} />
-        <meshBasicMaterial color="#3dbfe8" transparent opacity={0.028} side={BackSide} depthWrite={false} />
-      </mesh>
+      <Atmosphere />
     </group>
   );
 }
@@ -772,13 +803,6 @@ function useCountryGeo() {
   return geo;
 }
 
-function countryLabelMaxRank(cameraDistance: number) {
-  if (cameraDistance > 6.4) return 3;
-  if (cameraDistance > 4.6) return 4;
-  if (cameraDistance > 3.2) return 5;
-  return 7;
-}
-
 function CountryBorders({ geo }: { geo: CountryGeoJson }) {
   const geometry = useMemo(() => {
     const radius = earthRadius + 0.0022;
@@ -868,31 +892,6 @@ function LabelSprite({
     <sprite position={position} scale={[height * aspect, height, 1]}>
       <spriteMaterial map={texture} transparent depthWrite={false} toneMapped={false} />
     </sprite>
-  );
-}
-
-function CountryLabel({ name, lat, lon }: { name: string; lat: number; lon: number }) {
-  const position = useMemo(() => latLonPosition(lat, lon, earthRadius + 0.012), [lat, lon]);
-  return <LabelSprite position={position} text={name} color="#bfe9ff" height={0.048} />;
-}
-
-function CountryLabels({ geo, maxRank }: { geo: CountryGeoJson; maxRank: number }) {
-  const labels = useMemo(
-    () => geo.features
-      .filter((feature) => (feature.properties.LABELRANK ?? 10) <= maxRank)
-      .map((feature) => ({
-        name: feature.properties.ADMIN ?? feature.properties.NAME ?? '',
-        lat: feature.properties.LABEL_Y as number,
-        lon: feature.properties.LABEL_X as number,
-      }))
-      .filter((label) => label.name && Number.isFinite(label.lat) && Number.isFinite(label.lon)),
-    [geo, maxRank],
-  );
-
-  return (
-    <>
-      {labels.map((label) => <CountryLabel key={label.name} {...label} />)}
-    </>
   );
 }
 
@@ -1012,17 +1011,16 @@ function AircraftInstances({
       onPointerOut={() => { document.body.style.cursor = 'default'; }}
     >
       <primitive object={geometry} attach="geometry" />
-      {/* The geometry carries its own colours — white shell, grey wings, dark
-          fan faces, liveried fin — so one instanced draw call still reads as a
-          real airliner. The material tint only nudges each class apart, and the
-          faint emissive keeps traffic legible against a bright Earth. */}
+      {/* The geometry carries the high-visibility yellow scheme as vertex
+          colours — bright body, deeper wings, dark fin and fan faces — so one
+          instanced draw call still reads as an aircraft rather than a blob.
+          The warm emissive keeps traffic glowing on Earth's night side. */}
       <meshStandardMaterial
         vertexColors
-        color={variant === 'heavy' ? '#eafaff' : variant === 'rotor' ? '#ffeed6' : variant === 'light' ? '#dcf7ff' : '#ffffff'}
-        emissive={variant === 'rotor' ? '#7d5a1c' : '#0c5f78'}
-        emissiveIntensity={variant === 'rotor' ? 0.26 : 0.34}
-        metalness={0.42}
-        roughness={0.34}
+        emissive="#7a5200"
+        emissiveIntensity={0.4}
+        metalness={0.4}
+        roughness={0.36}
       />
     </instancedMesh>
   );
@@ -1044,7 +1042,9 @@ function AircraftFleet(props: Omit<Parameters<typeof AircraftInstances>[0], 'air
   );
 }
 
-const liveryPalette = ['#d21f3c', '#0a4fa3', '#1f8a4c', '#e08e0b', '#7a3ff2', '#c2185b', '#00838f', '#c2410c'];
+// Tail and cheatline markings. Kept inside the yellow family so an airline is
+// still distinguishable up close without breaking the high-visibility scheme.
+const liveryPalette = ['#a85f00', '#8a4606', '#c47a00', '#96550f', '#d18f0a', '#7d4406', '#b8560a', '#a87000'];
 
 function hashSeed(input: string) {
   let hash = 0;
@@ -1188,7 +1188,7 @@ function SelectedAircraft({
 
   return (
     <>
-      {paths && <Line points={trail} color="#dfff65" lineWidth={1} transparent opacity={0.5} />}
+      {paths && <Line points={trail} color="#5fe8ff" lineWidth={1} transparent opacity={0.55} />}
       <group ref={group}>
         <DetailedAircraftModel
           variant={variant}
@@ -1197,9 +1197,9 @@ function SelectedAircraft({
         />
         <mesh position={[0, 0, 0]} rotation={[Math.PI / 2, 0, 0]}>
           <ringGeometry args={[0.2, 0.215, 48]} />
-          <meshBasicMaterial color="#efff6d" transparent opacity={0.7} side={2} depthWrite={false} />
+          <meshBasicMaterial color="#5fe8ff" transparent opacity={0.75} side={2} depthWrite={false} />
         </mesh>
-        <pointLight color="#eaff62" intensity={2.4} distance={0.03} />
+        <pointLight color="#8ff2ff" intensity={2.4} distance={0.03} />
       </group>
     </>
   );
@@ -1462,7 +1462,6 @@ function GlobeScene({
   resetRequest,
   showCountries,
   countryGeo,
-  labelMaxRank,
   motionScale,
   onFlyMode,
   onPosition,
@@ -1481,7 +1480,6 @@ function GlobeScene({
   resetRequest: number;
   showCountries: boolean;
   countryGeo: CountryGeoJson | null;
-  labelMaxRank: number;
   motionScale: number;
   onFlyMode: (active: boolean) => void;
   onPosition: (value: [number, number, number]) => void;
@@ -1496,9 +1494,6 @@ function GlobeScene({
       <pointLight position={[-4, -1, -3]} intensity={2.1} color="#0a4f7c" />
       <Suspense fallback={null}><Earth /></Suspense>
       {showCountries && countryGeo && <CountryBorders geo={countryGeo} />}
-      {showCountries && countryGeo && (
-        <Suspense fallback={null}><CountryLabels geo={countryGeo} maxRank={labelMaxRank} /></Suspense>
-      )}
       <AircraftFleet aircraft={aircraft} selectedId={selected?.id} predictive={predictive} motionScale={motionScale} onSelect={onSelect} />
       {selected && <SelectedAircraft key={selected.id} flight={selected} predictive={predictive} paths={paths} motionScale={motionScale} />}
       {selected && route && (
@@ -1576,7 +1571,7 @@ export function AirTrafficApp() {
   const [searchFocused, setSearchFocused] = useState(false);
   const [predictive, setPredictive] = useState(true);
   const [paths, setPaths] = useState(true);
-  const [showCountries, setShowCountries] = useState(true);
+  const [showCountries, setShowCountries] = useState(false);
   const [motionSpeed, setMotionSpeed] = useState([1]);
   const [flyMode, setFlyMode] = useState(false);
   const [follow, setFollow] = useState(false);
@@ -1591,11 +1586,6 @@ export function AirTrafficApp() {
   const [newListName, setNewListName] = useState('');
   const countryGeo = useCountryGeo();
   const { route, loading: routeLoading } = useFlightRoute(selected);
-  const labelMaxRank = useMemo(
-    () => countryLabelMaxRank(Math.hypot(cameraPosition[0], cameraPosition[1], cameraPosition[2])),
-    [cameraPosition],
-  );
-
   useEffect(() => {
     const update = () => setUtc(new Date().toISOString().slice(11, 19));
     update();
@@ -1746,7 +1736,7 @@ export function AirTrafficApp() {
   return (
     <main className="relative h-dvh w-full overflow-hidden bg-[#02070c] text-slate-100 selection:bg-cyan-300/25">
       <div className="absolute inset-0">
-        <Canvas camera={{ position: [0, 0.3, 6.7], fov: 43, near: 0.00001, far: 150 }} dpr={[1, 2]} gl={{ antialias: true, powerPreference: 'high-performance' }}>
+        <Canvas camera={{ position: [0, 0.3, 6.7], fov: 43, near: 0.00001, far: 150 }} dpr={[1, 2]} gl={{ antialias: true, logarithmicDepthBuffer: true, powerPreference: 'high-performance' }}>
           <GlobeScene
             aircraft={filteredAircraft}
             selected={selected}
@@ -1761,7 +1751,6 @@ export function AirTrafficApp() {
             resetRequest={resetRequest}
             showCountries={showCountries}
             countryGeo={countryGeo}
-            labelMaxRank={labelMaxRank}
             motionScale={motionSpeed[0]}
             onFlyMode={setFlyMode}
             onPosition={setCameraPosition}
@@ -1980,7 +1969,7 @@ export function AirTrafficApp() {
             <p className="telemetry-label mb-3">Visualization</p>
             <label className="flex items-center justify-between py-1.5 text-xs text-slate-300"><span>Predictive movement</span><Switch checked={predictive} onCheckedChange={setPredictive} className="data-checked:bg-cyan-300" /></label>
             <label className="flex items-center justify-between py-1.5 text-xs text-slate-300"><span>Selected flight path</span><Switch checked={paths} onCheckedChange={setPaths} className="data-checked:bg-cyan-300" /></label>
-            <label className="flex items-center justify-between py-1.5 text-xs text-slate-300"><span>Country borders &amp; names</span><Switch checked={showCountries} onCheckedChange={setShowCountries} className="data-checked:bg-cyan-300" /></label>
+            <label className="flex items-center justify-between py-1.5 text-xs text-slate-300"><span>Extra country outlines</span><Switch checked={showCountries} onCheckedChange={setShowCountries} className="data-checked:bg-cyan-300" /></label>
             <label className="flex items-center justify-between py-1.5 text-xs text-slate-300"><span>Extended ADS-B networks</span><Switch checked={useNetworks} onCheckedChange={setUseNetworks} className="data-checked:bg-cyan-300" /></label>
             {useNetworks && (
               <>
