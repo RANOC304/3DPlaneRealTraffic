@@ -48,14 +48,14 @@ import {
   Euler,
   Float32BufferAttribute,
   InstancedMesh,
+  type Intersection,
   type MeshBasicMaterial,
   MeshStandardMaterial,
   Object3D,
   PerspectiveCamera,
   Quaternion,
+  type Raycaster,
   SRGBColorSpace,
-  type Texture,
-  TextureLoader,
   Vector3,
 } from 'three';
 
@@ -69,6 +69,22 @@ import {
   surfaceMaterial,
 } from '@/lib/aircraft-geometry';
 import { iataToIcaoAirline } from '@/lib/airline-codes';
+import {
+  airportUtcOffset,
+  formatLocalTime,
+  formatUtcOffset,
+  localDayShift,
+} from '@/lib/airport-time';
+import {
+  type MapTile,
+  baseMapTiles,
+  buildMapTileGeometry,
+  configureMapTiles,
+  isMapTileReady,
+  resolveMapTile,
+  selectMapTiles,
+  subscribeToMapTiles,
+} from '@/lib/map-tiles';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { NativeSelect, NativeSelectOption } from '@/components/ui/native-select';
@@ -127,6 +143,9 @@ type RouteAirport = {
 
 type FlightRoute = {
   callsign: string;
+  // The flight number as a passenger would recognise it, when the schedule
+  // database knows one: the transponder only ever broadcasts the ICAO form.
+  callsignIata: string | null;
   airline: string | null;
   origin: RouteAirport | null;
   destination: RouteAirport | null;
@@ -142,6 +161,18 @@ type FlightRoute = {
   trackStartTime: number | null;
   trackEndTime: number | null;
   itineraryKind: 'plausible' | 'unavailable';
+};
+
+type AircraftProfile = {
+  icao24: string;
+  registration: string | null;
+  type: string | null;
+  icaoType: string | null;
+  manufacturer: string | null;
+  owner: string | null;
+  ownerCountry: string | null;
+  operatorFlag: string | null;
+  photo: { url: string; link: string; photographer: string } | null;
 };
 
 type CountryFeature = {
@@ -307,7 +338,9 @@ const earthRadius = 2.4;
 // air gap above that mesh for the closest possible camera position.
 const earthBaseRadius = earthRadius - 0.0002;
 const mapSurfaceRadius = earthRadius + 0.00001;
-const minimumCameraAltitude = 0.0002;
+// About fifty metres over the ground at globe scale — low enough that the
+// deepest satellite level is worth reaching, still clear of the tile shell.
+const minimumCameraAltitude = 0.00002;
 const minimumCameraRadius = earthRadius + minimumCameraAltitude;
 const earthKilometers = 6371;
 const upVector = new Vector3(0, 1, 0);
@@ -316,6 +349,62 @@ const maxReportAgeSeconds = 1800;
 // Aircraft are drawn far larger than true scale so they read as aircraft rather
 // than as single pixels from orbit. This is that exaggeration factor.
 const aircraftSizeFactor = 0.1;
+// Even exaggerated, an airframe covers about a pixel of the globe seen from
+// orbit, so hit-testing the model itself is a test of aim rather than of
+// intent. Selection instead claims a fixed disc of screen around each aircraft,
+// the same size at any zoom, and picks the nearest aircraft inside it.
+const selectionPixelRadius = 13;
+// Free flight covers everything from creeping along a coastline to crossing an
+// ocean, so the throttle is exponential: the slider carries a 0-1 position and
+// every step of it is the same proportional change in speed. A linear scale
+// over this range would bury every usable slow speed in its first few pixels.
+const minimumFlySpeed = 0.01;
+const maximumFlySpeed = 6;
+
+/** Scene units per second for a 0-1 throttle position. */
+function flySpeedFor(throttle: number) {
+  return minimumFlySpeed * (maximumFlySpeed / minimumFlySpeed) ** throttle;
+}
+
+/** Smallest reusable instance buffer that can hold the current fleet bucket. */
+function instanceCapacity(count: number) {
+  if (count <= 1) return 1;
+  return 2 ** Math.ceil(Math.log2(count));
+}
+
+/**
+ * True when the globe itself stands between the camera and `target`, so an
+ * aircraft over the far hemisphere is not offered to a click aimed at the near
+ * one. `offset` must already be `target - origin`.
+ */
+function occludedByGlobe(origin: Vector3, offset: Vector3) {
+  const a = offset.lengthSq();
+  if (a < 1e-12) return false;
+  const b = 2 * origin.dot(offset);
+  const c = origin.lengthSq() - earthRadius * earthRadius;
+  const discriminant = b * b - 4 * a * c;
+  if (discriminant <= 0) return false;
+  const entry = (-b - Math.sqrt(discriminant)) / (2 * a);
+  return entry > 0 && entry < 1;
+}
+
+/** Distance over the ground between two coordinates, in kilometres. */
+function greatCircleKm(fromLat: number, fromLon: number, toLat: number, toLon: number) {
+  const lat1 = fromLat * degrees;
+  const lat2 = toLat * degrees;
+  const deltaLat = (toLat - fromLat) * degrees;
+  const deltaLon = (toLon - fromLon) * degrees;
+  const a = Math.sin(deltaLat / 2) ** 2
+    + Math.cos(lat1) * Math.cos(lat2) * Math.sin(deltaLon / 2) ** 2;
+  return 2 * earthKilometers * Math.asin(Math.min(1, Math.sqrt(a)));
+}
+
+/** `3h 31m`, or `39m` under the hour. */
+function formatDuration(seconds: number) {
+  const total = Math.max(0, Math.round(seconds / 60));
+  const hours = Math.floor(total / 60);
+  return hours > 0 ? `${hours}h ${String(total % 60).padStart(2, '0')}m` : `${total}m`;
+}
 
 function latLonPosition(lat: number, lon: number, radius: number, target = new Vector3()) {
   const phi = (90 - lat) * (Math.PI / 180);
@@ -459,253 +548,106 @@ function useFlightRoute(flight: Aircraft | null) {
   return { route, loading };
 }
 
-type MapTile = { zoom: number; x: number; y: number; url: string };
-type MapView = { zoom: number; x: number; y: number };
-
-const mapTileTemplate = process.env.NEXT_PUBLIC_SATELLITE_TILE_URL
-  ?? 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}';
-
-function mapZoom(distance: number) {
-  const altitude = Math.max(0, distance - earthRadius);
-  if (altitude > 2.3) return 3;
-  if (altitude > 1.05) return 4;
-  if (altitude > 0.45) return 5;
-  if (altitude > 0.2) return 6;
-  if (altitude > 0.09) return 7;
-  if (altitude > 0.04) return 8;
-  if (altitude > 0.018) return 9;
-  if (altitude > 0.008) return 10;
-  if (altitude > 0.0035) return 11;
-  if (altitude > 0.0015) return 12;
-  if (altitude > 0.0007) return 13;
-  if (altitude > 0.0005) return 14;
-  if (altitude > 0.00038) return 15;
-  if (altitude > 0.0003) return 16;
-  if (altitude > 0.00025) return 17;
-  return 18;
-}
-
-function mapViewForPosition(position: Vector3, cameraDistance = position.length()): MapView {
-  const positionDistance = position.length();
-  if (positionDistance < 0.001) return { zoom: 3, x: 4, y: 4 };
-  const zoom = mapZoom(cameraDistance);
-  const tileCount = 2 ** zoom;
-  const lat = Math.max(-85.05112878, Math.min(85.05112878, Math.asin(position.y / positionDistance) / degrees));
-  const lon = ((Math.atan2(position.z, -position.x) / degrees - 180) + 540) % 360 - 180;
-  const latitudeRadians = lat * degrees;
-  const x = Math.max(0, Math.min(tileCount - 1, Math.floor(((lon + 180) / 360) * tileCount)));
-  const y = Math.max(0, Math.min(tileCount - 1, Math.floor(
-    ((1 - Math.log(Math.tan(latitudeRadians) + 1 / Math.cos(latitudeRadians)) / Math.PI) / 2) * tileCount,
-  )));
-  return { zoom, x, y };
-}
-
-function mapAnchorForCamera(position: Vector3, direction: Vector3, target: Vector3) {
-  const projection = position.dot(direction);
-  const discriminant = projection * projection - (position.lengthSq() - earthRadius * earthRadius);
-  if (discriminant >= 0) {
-    const root = Math.sqrt(discriminant);
-    const nearIntersection = -projection - root;
-    const farIntersection = -projection + root;
-    const distance = nearIntersection >= 0 ? nearIntersection : farIntersection;
-    if (distance >= 0) {
-      return target.copy(direction).multiplyScalar(distance).add(position).normalize().multiplyScalar(earthRadius);
-    }
-  }
-
-  // When the camera looks into space, keep the tiles centered beneath it so
-  // turning back toward the horizon never reveals an unloaded black region.
-  return target.copy(position).normalize().multiplyScalar(earthRadius);
-}
-
-function mapTileUrl(zoom: number, x: number, y: number) {
-  return mapTileTemplate
-    .replace('{z}', String(zoom))
-    .replace('{x}', String(x))
-    .replace('{y}', String(y));
-}
-
-function mapTilesForView(view: MapView): MapTile[] {
-  const tileCount = 2 ** view.zoom;
-  // A compact nine-by-nine window covers the visible surface at the chosen
-  // zoom while still requesting only the area the person is actively viewing.
-  const radius = 4;
-  const tiles = new Map<string, MapTile>();
-  for (let offsetY = -radius; offsetY <= radius; offsetY++) {
-    const y = view.y + offsetY;
-    if (y < 0 || y >= tileCount) continue;
-    for (let offsetX = -radius; offsetX <= radius; offsetX++) {
-      const x = ((view.x + offsetX) % tileCount + tileCount) % tileCount;
-      const key = `${view.zoom}/${x}/${y}`;
-      tiles.set(key, { zoom: view.zoom, x, y, url: mapTileUrl(view.zoom, x, y) });
-    }
-  }
-  return [...tiles.values()];
-}
-
-function tileLatitude(y: number, tileCount: number) {
-  return Math.atan(Math.sinh(Math.PI * (1 - (2 * y) / tileCount))) / degrees;
-}
-
-function buildMapTileGeometry(tile: MapTile) {
-  const tileCount = 2 ** tile.zoom;
-  // A tile is a flat triangle mesh draped over a curved sphere. Wide low-zoom
-  // triangles bow through the base globe unless their angular step stays small;
-  // that intersection was the repeated black-diamond pattern on the map.
-  const segments = Math.max(3, Math.ceil(360 / tileCount));
-  const radius = mapSurfaceRadius;
-  const positions: number[] = [];
-  const uvs: number[] = [];
-  const indices: number[] = [];
-
-  for (let row = 0; row <= segments; row++) {
-    const rowProgress = row / segments;
-    const lat = tileLatitude(tile.y + rowProgress, tileCount);
-    for (let column = 0; column <= segments; column++) {
-      const columnProgress = column / segments;
-      const lon = ((tile.x + columnProgress) / tileCount) * 360 - 180;
-      const position = latLonPosition(lat, lon, radius);
-      positions.push(position.x, position.y, position.z);
-      // Satellite tiles start at the north-west corner; Three.js UVs start at
-      // the lower-left, so the vertical coordinate is intentionally inverted.
-      uvs.push(columnProgress, 1 - rowProgress);
-    }
-  }
-
-  for (let row = 0; row < segments; row++) {
-    for (let column = 0; column < segments; column++) {
-      const a = row * (segments + 1) + column;
-      const b = a + 1;
-      const c = a + segments + 1;
-      const d = c + 1;
-      indices.push(a, c, b, b, c, d);
-    }
-  }
-
-  const geometry = new BufferGeometry();
-  geometry.setAttribute('position', new Float32BufferAttribute(positions, 3));
-  geometry.setAttribute('uv', new Float32BufferAttribute(uvs, 2));
-  geometry.setIndex(indices);
-  geometry.computeBoundingSphere();
-  return geometry;
-}
-
-function isBlankSatelliteTexture(texture: Texture) {
-  try {
-    const canvas = document.createElement('canvas');
-    canvas.width = 8;
-    canvas.height = 8;
-    const context = canvas.getContext('2d', { willReadFrequently: true });
-    if (!context || !texture.image) return false;
-    context.drawImage(texture.image as CanvasImageSource, 0, 0, 8, 8);
-    const pixels = context.getImageData(0, 0, 8, 8).data;
-    let minimumLight = 255;
-    let maximumLight = 0;
-    let maximumChroma = 0;
-    for (let index = 0; index < pixels.length; index += 4) {
-      const red = pixels[index];
-      const green = pixels[index + 1];
-      const blue = pixels[index + 2];
-      minimumLight = Math.min(minimumLight, red, green, blue);
-      maximumLight = Math.max(maximumLight, red, green, blue);
-      maximumChroma = Math.max(maximumChroma, Math.abs(red - green), Math.abs(green - blue), Math.abs(blue - red));
-    }
-    return minimumLight > 170 && maximumLight - minimumLight < 55 && maximumChroma < 5;
-  } catch {
-    return false;
-  }
-}
-
-function DetailedMapTile({ tile }: { tile: MapTile }) {
-  const { gl } = useThree();
-  const geometry = useMemo(() => buildMapTileGeometry(tile), [tile.x, tile.y, tile.zoom]);
-  const [texture, setTexture] = useState<Texture | null>(null);
+// The registry entry and photograph for one airframe. Keyed on the ICAO24, so
+// following the same aircraft through several callsigns never re-fetches it.
+function useAircraftProfile(icao24: string | null) {
+  const [profile, setProfile] = useState<AircraftProfile | null>(null);
 
   useEffect(() => {
-    let active = true;
-    let loadedTexture: Texture | null = null;
-    const loader = new TextureLoader();
-    loader.setCrossOrigin('anonymous');
+    if (!icao24) {
+      setProfile(null);
+      return;
+    }
 
-    const loadAvailableTile = (zoom: number, x: number, y: number) => {
-      loader.load(
-        mapTileUrl(zoom, x, y),
-        (loaded) => {
-          if (!active) {
-            loaded.dispose();
-            return;
-          }
-          if (zoom > 3 && isBlankSatelliteTexture(loaded)) {
-            loaded.dispose();
-            loadAvailableTile(zoom - 1, Math.floor(x / 2), Math.floor(y / 2));
-            return;
-          }
+    const controller = new AbortController();
+    setProfile(null);
+    void fetch(`/api/aircraft-profile?icao24=${encodeURIComponent(icao24)}`, {
+      cache: 'no-store',
+      signal: controller.signal,
+    })
+      .then(async (response) => (response.ok ? ((await response.json()) as AircraftProfile) : null))
+      .then((data) => setProfile(data))
+      .catch(() => {});
 
-          const levelDifference = tile.zoom - zoom;
-          const parentScale = 2 ** levelDifference;
-          const repeat = 1 / parentScale;
-          loaded.repeat.set(repeat, repeat);
-          loaded.offset.set(
-            (tile.x % parentScale) * repeat,
-            (parentScale - 1 - (tile.y % parentScale)) * repeat,
-          );
-          loadedTexture = loaded;
-          loaded.colorSpace = SRGBColorSpace;
-          loaded.anisotropy = Math.min(16, gl.capabilities.getMaxAnisotropy());
-          loaded.needsUpdate = true;
-          setTexture(loaded);
-        },
-        undefined,
-        () => {
-          if (active && zoom > 3) loadAvailableTile(zoom - 1, Math.floor(x / 2), Math.floor(y / 2));
-        },
-      );
-    };
+    return () => controller.abort();
+  }, [icao24]);
 
-    loadAvailableTile(tile.zoom, tile.x, tile.y);
-    return () => {
-      active = false;
-      loadedTexture?.dispose();
-    };
-  }, [gl, tile.url]);
+  return profile;
+}
+
+function MapTileMesh({ tile }: { tile: MapTile }) {
+  // Whatever imagery exists for this ground right now: its own if it has
+  // arrived, otherwise the nearest ancestor's, so the tile is never a hole.
+  const source = resolveMapTile(tile);
+  const sourceZoom = source?.zoom ?? tile.zoom;
+  const geometry = useMemo(
+    () => buildMapTileGeometry(tile, mapSurfaceRadius, sourceZoom),
+    [sourceZoom, tile],
+  );
 
   useEffect(() => () => geometry.dispose(), [geometry]);
 
-  if (!texture) return null;
+  if (!source) return null;
   return (
-    <mesh geometry={geometry} renderOrder={1}>
-      <meshBasicMaterial
-        map={texture}
-        toneMapped={false}
-        polygonOffset
-        polygonOffsetFactor={-1}
-        polygonOffsetUnits={-1}
-      />
+    // Levels are layered by draw order rather than by depth: the tiles all sit
+    // on one sphere, so letting them write depth makes the finer level fight the
+    // coarser one it is refining. The opaque globe underneath still occludes
+    // everything on the far side.
+    <mesh geometry={geometry} renderOrder={tile.zoom}>
+      <meshBasicMaterial map={source.texture} toneMapped={false} depthWrite={false} />
     </mesh>
   );
 }
 
+function sameTiles(current: MapTile[], next: MapTile[]) {
+  return current.length === next.length && current.every((tile, index) => tile.key === next[index].key);
+}
+
 function DetailedEarthMap() {
-  const { camera } = useThree();
-  const [view, setView] = useState<MapView>(() => mapViewForPosition(camera.position));
+  const { camera, gl } = useThree();
+  const [tiles, setTiles] = useState<MapTile[]>(baseMapTiles);
+  const [, setRevision] = useState(0);
+  const lastSelection = useRef<MapTile[]>(baseMapTiles);
+  // Ground that has left the selection but still has imagery loaded. Holding it
+  // for a moment means a fast zoom or pan is covered by the map it is leaving
+  // until the map it is arriving at can take over.
+  const fading = useRef(new Map<string, { tile: MapTile; expiresAt: number }>());
   const lastCheck = useRef(0);
-  const viewDirection = useMemo(() => new Vector3(), []);
-  const viewAnchor = useMemo(() => new Vector3(), []);
-  const tiles = useMemo(() => mapTilesForView(view), [view]);
+
+  useEffect(() => {
+    configureMapTiles(Math.min(16, gl.capabilities.getMaxAnisotropy()));
+  }, [gl]);
+
+  useEffect(() => subscribeToMapTiles(() => setRevision((value) => value + 1)), []);
 
   useFrame(() => {
     const now = performance.now();
-    if (now - lastCheck.current < 180) return;
+    if (now - lastCheck.current < 150) return;
     lastCheck.current = now;
-    camera.getWorldDirection(viewDirection).normalize();
-    mapAnchorForCamera(camera.position, viewDirection, viewAnchor);
-    const next = mapViewForPosition(viewAnchor, camera.position.length());
-    setView((current) => (
-      current.zoom === next.zoom && current.x === next.x && current.y === next.y ? current : next
-    ));
+
+    const selection = selectMapTiles({
+      camera: camera as PerspectiveCamera,
+      radius: mapSurfaceRadius,
+      viewportHeight: gl.domElement.height,
+    });
+    const live = new Set(selection.map((tile) => tile.key));
+
+    for (const tile of lastSelection.current) {
+      if (!live.has(tile.key) && isMapTileReady(tile)) {
+        fading.current.set(tile.key, { tile, expiresAt: now + 1500 });
+      }
+    }
+    lastSelection.current = selection;
+    for (const [key, entry] of fading.current) {
+      if (live.has(key) || entry.expiresAt <= now) fading.current.delete(key);
+    }
+    while (fading.current.size > 160) fading.current.delete(fading.current.keys().next().value!);
+
+    const rendered = [...selection, ...[...fading.current.values()].map((entry) => entry.tile)];
+    setTiles((current) => (sameTiles(current, rendered) ? current : rendered));
   });
 
-  return <>{tiles.map((tile) => <DetailedMapTile key={`${tile.zoom}/${tile.x}/${tile.y}`} tile={tile} />)}</>;
+  return <>{tiles.map((tile) => <MapTileMesh key={tile.key} tile={tile} />)}</>;
 }
 
 function Atmosphere() {
@@ -1035,24 +977,37 @@ function AircraftInstances({
   motionScale: number;
   onSelect: (flight: Aircraft) => void;
 }) {
-  const { camera } = useThree();
+  const { camera, size } = useThree();
   const ref = useRef<InstancedMesh>(null);
   const dummy = useMemo(() => new Object3D(), []);
   const orientation = useMemo(() => new Quaternion(), []);
   const radial = useMemo(() => new Vector3(), []);
   const headingRotation = useMemo(() => new Quaternion(), []);
   const targetPosition = useMemo(() => new Vector3(), []);
+  const rayOffset = useMemo(() => new Vector3(), []);
   const smoothedPositions = useRef(new Map<string, Vector3>());
   const smoothedOrientations = useRef(new Map<string, Quaternion>());
   const geometry = useMemo(() => createFleetAircraftGeometry(variant), [variant]);
   useEffect(() => () => geometry.dispose(), [geometry]);
   const material = useSelfLitFleetMaterial();
 
+  // The instance buffer is sized in powers of two and only ever grows, so the
+  // live count moving with every feed refresh re-uses the same mesh instead of
+  // reallocating one several times a minute. `count` is what tracks the total
+  // actually in the sky.
+  const [capacity, setCapacity] = useState(() => instanceCapacity(aircraft.length));
+  useEffect(() => {
+    setCapacity((current) => (aircraft.length > current ? instanceCapacity(aircraft.length) : current));
+  }, [aircraft.length]);
+  const drawn = Math.min(aircraft.length, capacity);
+
   const updateMatrices = useCallback((timestamp: number, delta: number) => {
     const mesh = ref.current;
     if (!mesh) return;
+    mesh.count = drawn;
     const blend = 1 - Math.exp(-Math.min(delta, 0.1) * 7.5);
-    aircraft.forEach((flight, index) => {
+    for (let index = 0; index < drawn; index++) {
+      const flight = aircraft[index];
       globePosition(flight, timestamp, predictive, 0, targetPosition, motionScale);
       let position = smoothedPositions.current.get(flight.id);
       if (!position) {
@@ -1084,9 +1039,9 @@ function AircraftInstances({
       dummy.scale.setScalar(scale);
       dummy.updateMatrix();
       mesh.setMatrixAt(index, dummy.matrix);
-    });
+    }
     mesh.instanceMatrix.needsUpdate = true;
-  }, [aircraft, camera, dummy, headingRotation, motionScale, orientation, predictive, radial, selectedId, targetPosition]);
+  }, [aircraft, camera, drawn, dummy, headingRotation, motionScale, orientation, predictive, radial, selectedId, targetPosition]);
 
   useEffect(() => {
     const visibleIds = new Set(aircraft.map((flight) => flight.id));
@@ -1107,11 +1062,35 @@ function AircraftInstances({
     updateMatrices(preciseNowSeconds(), delta);
   });
 
+  // Pointing at an aircraft, rather than hitting its handful of pixels. Each
+  // aircraft claims a disc of `selectionPixelRadius` around it on screen, and
+  // whichever of those discs the cursor falls in nearest the camera is the hit —
+  // so a click lands on the aircraft it was aimed at from orbit as readily as
+  // from a few hundred metres away.
+  const raycast = useCallback((raycaster: Raycaster, intersects: Intersection[]) => {
+    const mesh = ref.current;
+    const view = raycaster.camera as PerspectiveCamera | undefined;
+    if (!mesh || !view?.isPerspectiveCamera) return;
+    const { origin, direction } = raycaster.ray;
+    // Half the frustum height one unit ahead, divided by the viewport: the world
+    // size of a single pixel at unit depth, so the pick radius grows with range.
+    const worldPerPixel = (2 * Math.tan((view.fov * degrees) / 2)) / Math.max(1, size.height);
+
+    for (let index = 0; index < drawn; index++) {
+      const position = smoothedPositions.current.get(aircraft[index].id);
+      if (!position) continue;
+      rayOffset.subVectors(position, origin);
+      const depth = rayOffset.dot(direction);
+      if (depth <= 0) continue;
+      const reach = selectionPixelRadius * worldPerPixel * depth;
+      if (rayOffset.lengthSq() - depth * depth > reach * reach) continue;
+      if (occludedByGlobe(origin, rayOffset)) continue;
+      intersects.push({ distance: depth, point: position.clone(), object: mesh, instanceId: index });
+    }
+  }, [aircraft, drawn, rayOffset, size.height]);
+
   return (
-    <instancedMesh
-      ref={ref}
-      args={[undefined, undefined, aircraft.length]}
-      frustumCulled={false}
+    <group
       onClick={(event: ThreeEvent<MouseEvent>) => {
         event.stopPropagation();
         if (event.instanceId !== undefined) onSelect(aircraft[event.instanceId]);
@@ -1119,9 +1098,16 @@ function AircraftInstances({
       onPointerOver={() => { document.body.style.cursor = 'pointer'; }}
       onPointerOut={() => { document.body.style.cursor = 'default'; }}
     >
-      <primitive object={geometry} attach="geometry" />
-      <primitive object={material} attach="material" />
-    </instancedMesh>
+      <instancedMesh
+        ref={ref}
+        args={[undefined, undefined, capacity]}
+        frustumCulled={false}
+        raycast={raycast}
+      >
+        <primitive object={geometry} attach="geometry" />
+        <primitive object={material} attach="material" />
+      </instancedMesh>
+    </group>
   );
 }
 
@@ -1407,9 +1393,6 @@ function FlyMovement({ active, speed }: { active: boolean; speed: number }) {
   const right = useMemo(() => new Vector3(), []);
   const localUp = useMemo(() => new Vector3(), []);
   const thrust = useMemo(() => new Vector3(), []);
-  const velocity = useRef(new Vector3());
-  const orientationEuler = useMemo(() => new Euler(0, 0, 0, 'YXZ'), []);
-  const baseFov = useRef<number | null>(null);
 
   useEffect(() => {
     const down = (event: KeyboardEvent) => keys.current.add(event.code);
@@ -1423,67 +1406,41 @@ function FlyMovement({ active, speed }: { active: boolean; speed: number }) {
     };
   }, []);
 
+  // Free flight keeps the horizon level: the mouse only ever changes where the
+  // camera points, never how it is rolled, so any tilt another mode left behind
+  // is taken out on the way in rather than riding along for the whole flight.
   useEffect(() => {
-    if (!active) velocity.current.set(0, 0, 0);
-  }, [active]);
+    if (!active) return;
+    const level = new Euler(0, 0, 0, 'YXZ').setFromQuaternion(camera.quaternion, 'YXZ');
+    if (level.z === 0) return;
+    level.z = 0;
+    camera.quaternion.setFromEuler(level);
+  }, [active, camera]);
 
   useFrame((_, rawDelta) => {
-    const perspectiveCamera = camera as PerspectiveCamera;
-    if (baseFov.current === null) baseFov.current = perspectiveCamera.fov;
+    if (!active) return;
     const delta = Math.min(rawDelta, 0.1);
-
-    if (!active) {
-      // Settle any residual bank/speed-FOV once control is released.
-      orientationEuler.setFromQuaternion(camera.quaternion, 'YXZ');
-      if (Math.abs(orientationEuler.z) > 0.0005) {
-        orientationEuler.z *= Math.max(0, 1 - delta * 6);
-        camera.quaternion.setFromEuler(orientationEuler);
-      }
-      if (baseFov.current !== null && perspectiveCamera.fov !== baseFov.current) {
-        perspectiveCamera.fov += (baseFov.current - perspectiveCamera.fov) * Math.min(1, delta * 5);
-        perspectiveCamera.updateProjectionMatrix();
-      }
-      return;
-    }
-
     const held = keys.current;
-    const boosting = held.has('ShiftLeft') || held.has('ShiftRight');
-    const boostFactor = boosting ? 3.2 : 1;
-    const cruiseSpeed = speed * boostFactor * 6.5;
+    const cruiseSpeed = speed * (held.has('ShiftLeft') || held.has('ShiftRight') ? 3 : 1);
 
     camera.getWorldDirection(forward).normalize();
     right.crossVectors(forward, camera.up).normalize();
     localUp.crossVectors(right, forward).normalize();
 
     thrust.set(0, 0, 0);
-    let lateral = 0;
     if (held.has('KeyZ') || held.has('KeyW') || held.has('ArrowUp')) thrust.addScaledVector(forward, 1);
     if (held.has('KeyS') || held.has('ArrowDown')) thrust.addScaledVector(forward, -1);
-    if (held.has('KeyQ') || held.has('KeyA') || held.has('ArrowLeft')) { thrust.addScaledVector(right, -1); lateral -= 1; }
-    if (held.has('KeyD') || held.has('ArrowRight')) { thrust.addScaledVector(right, 1); lateral += 1; }
+    if (held.has('KeyQ') || held.has('KeyA') || held.has('ArrowLeft')) thrust.addScaledVector(right, -1);
+    if (held.has('KeyD') || held.has('ArrowRight')) thrust.addScaledVector(right, 1);
     if (held.has('Space') || held.has('KeyR') || held.has('KeyE')) thrust.addScaledVector(localUp, 1);
     if (held.has('ControlLeft') || held.has('ControlRight') || held.has('KeyF') || held.has('KeyC')) thrust.addScaledVector(localUp, -1);
-    if (thrust.lengthSq() > 0) thrust.normalize().multiplyScalar(cruiseSpeed);
+    if (thrust.lengthSq() === 0) return;
 
-    // Ease velocity toward the thrust target (and toward zero when coasting) so
-    // the ship carries momentum instead of snapping to a fixed speed — a
-    // spacecraft-style inertial feel rather than arcade FPS movement.
-    const responsiveness = thrust.lengthSq() > 0 ? 3.4 : 1.6;
-    velocity.current.lerp(thrust, 1 - Math.exp(-responsiveness * delta));
-    if (velocity.current.length() > cruiseSpeed * 1.05) velocity.current.setLength(cruiseSpeed * 1.05);
-    camera.position.addScaledVector(velocity.current, delta);
-
-    // Bank into lateral thrust and pulse the FOV under speed, like a ship's
-    // inertial dampers straining to keep up with the throttle.
-    orientationEuler.setFromQuaternion(camera.quaternion, 'YXZ');
-    const targetRoll = -lateral * 0.34;
-    orientationEuler.z += (targetRoll - orientationEuler.z) * Math.min(1, delta * 4.5);
-    camera.quaternion.setFromEuler(orientationEuler);
-
-    const speedFraction = cruiseSpeed > 0 ? Math.min(1, velocity.current.length() / cruiseSpeed) : 0;
-    const targetFov = baseFov.current + speedFraction * (boosting ? 10 : 4);
-    perspectiveCamera.fov += (targetFov - perspectiveCamera.fov) * Math.min(1, delta * 4);
-    perspectiveCamera.updateProjectionMatrix();
+    // Movement is exactly the throttle setting for as long as a key is held and
+    // nothing at all on the frame it is released — no momentum carrying the
+    // camera past what it was aimed at, no bank into a turn, no lens flex under
+    // speed. Sideways is sideways.
+    camera.position.addScaledVector(thrust.normalize(), cruiseSpeed * delta);
   });
 
   return null;
@@ -1546,6 +1503,39 @@ function CameraDirector({
         Number(camera.position.z.toFixed(2)),
       ]);
     }
+  });
+
+  return null;
+}
+
+/**
+ * OrbitControls dollies by a fixed fraction of the distance to whatever it is
+ * orbiting, and with the globe's centre as that target almost all of that
+ * distance is the planet's own radius: close to the ground a single wheel notch
+ * is worth more than the altitude that is left, so the last kilometres of a
+ * descent simply cannot be flown. Rescaling zoomSpeed by the height above the
+ * surface makes every notch the same fraction of that height instead, which
+ * turns orbit-to-rooftop into one continuous move and is what puts the deepest
+ * satellite levels in reach. Orbiting a selected aircraft has no meaningful
+ * altitude of its own, so there the fraction falls back to the orbit radius.
+ */
+const zoomStepFraction = 0.2;
+
+function AltitudeScaledZoom() {
+  const camera = useThree((state) => state.camera);
+  const controls = useThree((state) => state.controls) as
+    | { target?: Vector3; zoomSpeed?: number }
+    | null;
+
+  useFrame(() => {
+    if (!controls?.target || typeof controls.zoomSpeed !== 'number') return;
+    const range = camera.position.distanceTo(controls.target);
+    if (!(range > 1e-9)) return;
+    const altitude = Math.max(camera.position.length() - earthRadius, minimumCameraAltitude);
+    // Solve 0.95 ** zoomSpeed === the step we want, so one notch closes
+    // `zoomStepFraction` of whichever is smaller, the altitude or the orbit.
+    const step = 1 - zoomStepFraction * (Math.min(altitude, range) / range);
+    controls.zoomSpeed = Math.log(step) / Math.log(0.95);
   });
 
   return null;
@@ -1627,7 +1617,6 @@ function GlobeScene({
         enableDamping
         dampingFactor={0.055}
         rotateSpeed={0.48}
-        zoomSpeed={0.72}
         panSpeed={0.65}
         minDistance={minimumCameraAltitude}
         maxDistance={30}
@@ -1642,8 +1631,197 @@ function GlobeScene({
       />
       <FlyMovement active={flyMode} speed={speed} />
       <CameraDirector selected={selected} predictive={predictive} follow={follow} focusRequest={focusRequest} resetRequest={resetRequest} motionScale={motionScale} onPosition={onPosition} />
+      <AltitudeScaledZoom />
       <EarthSurfaceCollision />
     </>
+  );
+}
+
+/**
+ * Everything a flight-tracking site puts on screen when you tap an aircraft:
+ * who is operating it, what it is, a photograph of the airframe, the airports at
+ * each end with their local clocks, and how far along the leg it is.
+ *
+ * Scheduled times are not in any free data source, so nothing here is presented
+ * as one. Departure is the moment receivers first heard this airframe on this
+ * leg, and arrival is projected from the ground still to cover at the speed it
+ * is doing now — both labelled for what they are.
+ */
+function FlightSummary({
+  flight,
+  route,
+  profile,
+  loading,
+}: {
+  flight: Aircraft | null;
+  route: FlightRoute | null;
+  profile: AircraftProfile | null;
+  loading?: boolean;
+}) {
+  const origin = route?.origin ?? null;
+  const destination = route?.destination ?? null;
+  const now = nowSeconds();
+
+  const leg = useMemo(() => {
+    if (!origin || !destination) return null;
+    const total = greatCircleKm(origin.latitude, origin.longitude, destination.latitude, destination.longitude);
+    if (!flight) return { total, flown: null, remaining: null, progress: null, eta: null };
+
+    const flown = greatCircleKm(origin.latitude, origin.longitude, flight.lat, flight.lon);
+    const remaining = greatCircleKm(flight.lat, flight.lon, destination.latitude, destination.longitude);
+    // Both halves are measured from where the aircraft actually is, so a
+    // diversion or a hold reads as a route longer than the direct one rather
+    // than as a progress bar running past its own end.
+    const covered = flown + remaining;
+    const groundSpeedKmh = flight.speed * 3.6;
+    return {
+      total,
+      flown,
+      remaining,
+      progress: covered > 0 ? Math.max(0, Math.min(1, flown / covered)) : null,
+      eta: groundSpeedKmh > 40 ? now + (remaining / groundSpeedKmh) * 3600 : null,
+    };
+  }, [destination, flight, now, origin]);
+
+  const clocks = useMemo(() => {
+    const at = new Date(now * 1000);
+    return {
+      origin: origin ? airportUtcOffset(origin, at) : null,
+      destination: destination ? airportUtcOffset(destination, at) : null,
+    };
+  }, [destination, now, origin]);
+
+  const departure = route?.trackStartTime ?? null;
+  const arrival = leg?.eta ?? null;
+  // Receivers do not always hear an aircraft from the runway, so the track can
+  // begin mid-flight. When the ground already covered could not have been flown
+  // in the time on the track, this is a pick-up point rather than a departure,
+  // and saying so is better than printing a takeoff time that never happened.
+  const flownHours = leg?.flown && flight && flight.speed > 11 ? leg.flown / (flight.speed * 3.6) : null;
+  const departed = departure !== null
+    && (flownHours === null || now - departure >= flownHours * 3600 * 0.6);
+  // Read each end on its own clock, so a red-eye that lands the next morning
+  // gets the +1 an arrivals board would give it.
+  const dayShift = arrival !== null && clocks.destination && clocks.origin
+    ? localDayShift(arrival, clocks.destination.minutes, departure ?? now, clocks.origin.minutes)
+    : 0;
+  const identity = [route?.callsignIata, profile?.registration].filter((value): value is string => Boolean(value));
+  const airframe = profile?.icaoType ?? flight?.model ?? null;
+  const description = [profile?.manufacturer, profile?.type].filter(Boolean).join(' ');
+  const operator = route?.airline ?? profile?.owner ?? null;
+
+  if (loading && !route && !profile) {
+    return <p className="font-mono text-[9px] tracking-wider text-slate-500">RESOLVING FLIGHT…</p>;
+  }
+
+  return (
+    <div className="space-y-3">
+      {(operator || airframe || identity.length > 0) && (
+        <div className="flex items-start gap-2">
+          <div className="min-w-0 flex-1">
+            {operator && <p className="truncate text-xs font-medium text-white">{operator}</p>}
+            {description && <p className="mt-0.5 truncate text-[10px] text-slate-500">{description}</p>}
+          </div>
+          <div className="flex shrink-0 flex-wrap justify-end gap-1">
+            {identity.map((value) => (
+              <span key={value} className="border border-cyan-300/25 bg-cyan-300/[0.07] px-1.5 py-0.5 font-mono text-[9px] tracking-wider text-cyan-200">{value}</span>
+            ))}
+            {airframe && <span className="border border-white/10 bg-white/[0.05] px-1.5 py-0.5 font-mono text-[9px] tracking-wider text-slate-300">{airframe}</span>}
+          </div>
+        </div>
+      )}
+
+      {profile?.photo && (
+        <a href={profile.photo.link} target="_blank" rel="noreferrer" className="group relative block overflow-hidden border border-white/[0.08]">
+          {/* A third-party photo host on a worker runtime with no image
+              optimiser in front of it; the framework loader has nothing to add. */}
+          {/* eslint-disable-next-line next/no-img-element */}
+          <img
+            src={profile.photo.url}
+            alt={`${profile.registration ?? 'Aircraft'} photographed by ${profile.photo.photographer}`}
+            loading="lazy"
+            className="h-[104px] w-full object-cover transition duration-500 group-hover:scale-[1.03]"
+          />
+          {/* Planespotters licences these on the condition the photographer is
+              credited and the picture links back to the original. */}
+          <span className="absolute bottom-0 right-0 bg-[#020a10]/80 px-1.5 py-0.5 font-mono text-[8px] tracking-wide text-slate-400">© {profile.photo.photographer} / Planespotters</span>
+        </a>
+      )}
+
+      {origin && destination ? (
+        <>
+          <div className="flex items-stretch gap-2">
+            <div className="min-w-0 flex-1">
+              <p className="font-mono text-[19px] font-semibold leading-none tracking-wide text-lime-200">{origin.iata || origin.icao}</p>
+              <p className="mt-1 truncate text-[10px] text-slate-300">{origin.municipality || origin.name}</p>
+              {clocks.origin && (
+                <p className="mt-0.5 font-mono text-[8px] tracking-wider text-slate-600">
+                  {formatUtcOffset(clocks.origin.minutes)}{clocks.origin.estimated ? ' EST' : ''}
+                </p>
+              )}
+            </div>
+            <div className="flex shrink-0 items-center px-1"><Plane className="size-4 rotate-90 text-cyan-300" /></div>
+            <div className="min-w-0 flex-1 text-right">
+              <p className="font-mono text-[19px] font-semibold leading-none tracking-wide text-orange-200">{destination.iata || destination.icao}</p>
+              <p className="mt-1 truncate text-[10px] text-slate-300">{destination.municipality || destination.name}</p>
+              {clocks.destination && (
+                <p className="mt-0.5 font-mono text-[8px] tracking-wider text-slate-600">
+                  {formatUtcOffset(clocks.destination.minutes)}{clocks.destination.estimated ? ' EST' : ''}
+                </p>
+              )}
+            </div>
+          </div>
+
+          {departure === null && arrival === null ? (
+            // Nothing is flying this leg within earshot, so there are no times
+            // to give; the length of the leg itself is still worth knowing.
+            <div className="border border-white/[0.08] bg-[#02080d]/60 p-2">
+              <p className="telemetry-label">Great-circle distance</p>
+              <p className="mt-1 font-mono text-[13px] text-white">{formatNumber(leg?.total ?? 0)}<span className="ml-1 text-[9px] text-slate-500">km</span></p>
+            </div>
+          ) : (
+          <div className="grid grid-cols-2 gap-2">
+            <div className="border border-white/[0.08] bg-[#02080d]/60 p-2">
+              <p className="telemetry-label">{departed ? 'Departed' : 'First seen'}</p>
+              <p className="mt-1 font-mono text-[13px] text-white">
+                {departure !== null && clocks.origin ? formatLocalTime(departure, clocks.origin.minutes) : '—'}
+                <span className="ml-1 text-[9px] text-slate-500">{departure !== null ? 'local' : ''}</span>
+              </p>
+            </div>
+            <div className="border border-white/[0.08] bg-[#02080d]/60 p-2">
+              <p className="telemetry-label">Arriving</p>
+              <p className="mt-1 font-mono text-[13px] text-white">
+                {arrival !== null && clocks.destination ? formatLocalTime(arrival, clocks.destination.minutes) : '—'}
+                {dayShift > 0 && <span className="ml-0.5 align-super text-[8px] text-amber-200">+{dayShift}</span>}
+                <span className="ml-1 text-[9px] text-slate-500">{arrival !== null ? 'est.' : ''}</span>
+              </p>
+            </div>
+          </div>
+          )}
+
+          {leg?.progress !== null && leg?.progress !== undefined && (
+            <div>
+              <div className="relative h-[3px] w-full bg-white/[0.08]">
+                <div className="absolute inset-y-0 left-0 bg-cyan-300" style={{ width: `${leg.progress * 100}%` }} />
+                <Plane className="absolute top-1/2 size-3 -translate-x-1/2 -translate-y-1/2 rotate-90 text-cyan-200" style={{ left: `${leg.progress * 100}%` }} />
+              </div>
+              <div className="mt-2 flex items-start justify-between gap-2 font-mono text-[9px] tracking-wider text-slate-500">
+                <span>
+                  {formatNumber(leg.flown ?? 0)} km
+                  {departed && departure !== null && <span className="ml-1 text-slate-600">{formatDuration(now - departure)} ago</span>}
+                </span>
+                <span className="text-right">
+                  {formatNumber(leg.remaining ?? 0)} km
+                  {arrival !== null && <span className="ml-1 text-slate-600">in {formatDuration(arrival - now)}</span>}
+                </span>
+              </div>
+            </div>
+          )}
+        </>
+      ) : (
+        <p className="text-[10px] leading-4 text-slate-500">No scheduled route matched this callsign, so there is no itinerary to show.</p>
+      )}
+    </div>
   );
 }
 
@@ -1697,7 +1875,7 @@ export function AirTrafficApp() {
   const [motionSpeed, setMotionSpeed] = useState([1]);
   const [flyMode, setFlyMode] = useState(false);
   const [follow, setFollow] = useState(false);
-  const [flySpeed, setFlySpeed] = useState([0.65]);
+  const [flyThrottle, setFlyThrottle] = useState([0.53]);
   const [focusRequest, setFocusRequest] = useState(0);
   const [resetRequest, setResetRequest] = useState(0);
   const [orbitTarget, setOrbitTarget] = useState<[number, number, number]>([0, 0, 0]);
@@ -1708,6 +1886,7 @@ export function AirTrafficApp() {
   const [newListName, setNewListName] = useState('');
   const countryGeo = useCountryGeo();
   const { route, loading: routeLoading } = useFlightRoute(selected);
+  const selectedProfile = useAircraftProfile(selected?.id ?? null);
   useEffect(() => {
     const update = () => setUtc(new Date().toISOString().slice(11, 19));
     update();
@@ -1733,6 +1912,7 @@ export function AirTrafficApp() {
     return () => window.removeEventListener('keydown', shortcut);
   }, []);
 
+  const flySpeed = flySpeedFor(flyThrottle[0]);
   const countries = useMemo(() => [...new Set(aircraft.map((flight) => flight.country))].sort((a, b) => a.localeCompare(b)), [aircraft]);
 
   const filteredAircraft = useMemo(() => {
@@ -1780,6 +1960,9 @@ export function AirTrafficApp() {
 
   const untrackedCallsign = suggestions.length === 0 && searchFocused ? resolvedCallsign : null;
   const { route: untrackedRoute, found: untrackedFound, loading: untrackedLoading } = useCallsignLookup(untrackedCallsign);
+  // A searched flight that no receiver can hear still has an airframe behind it
+  // once an extended network names one, so it gets the same dossier.
+  const untrackedProfile = useAircraftProfile(untrackedFound?.aircraft.id ?? null);
 
   // Aircraft the extended networks found that the OpenSky snapshot lacks. They
   // are merged into the scene so a searched flight can actually be seen, then
@@ -1852,6 +2035,10 @@ export function AirTrafficApp() {
     else void document.exitFullscreen();
   };
 
+  // The OpenSky snapshot carries no airframe identity, so when the selected
+  // aircraft came from there the registry lookup fills those two readouts in.
+  const selectedRegistration = selected?.registration ?? selectedProfile?.registration ?? null;
+  const selectedModel = selected?.model ?? selectedProfile?.icaoType ?? null;
   const lastContactAge = selected ? Math.max(0, nowSeconds() - selected.lastContact) : 0;
   const sourceAge = meta ? Math.max(0, nowSeconds() - meta.sourceTimestamp) : 0;
 
@@ -1867,7 +2054,7 @@ export function AirTrafficApp() {
             paths={paths}
             flyMode={flyMode}
             follow={follow}
-            speed={flySpeed[0]}
+            speed={flySpeed}
             orbitTarget={orbitTarget}
             focusRequest={focusRequest}
             resetRequest={resetRequest}
@@ -1941,17 +2128,13 @@ export function AirTrafficApp() {
                       <span className="ml-auto font-mono text-[8px] tracking-wider text-cyan-300/70">{untrackedFound.source.toUpperCase()}</span>
                     </button>
                   )}
-                  {!untrackedLoading && untrackedRoute?.itineraryKind === 'plausible' && untrackedRoute.origin && untrackedRoute.destination && (
-                    <div className="mt-2.5 border border-white/[0.08] bg-white/[0.02] p-2">
-                      {untrackedRoute.airline && <p className="text-[10px] text-slate-300">{untrackedRoute.airline}</p>}
-                      <div className="mt-1 flex items-center gap-2 font-mono text-[10px] text-white">
-                        <span className="text-lime-200">{untrackedRoute.origin.iata || untrackedRoute.origin.icao}</span>
-                        <ArrowRight className="size-3 text-slate-600" />
-                        <span className="text-orange-200">{untrackedRoute.destination.iata || untrackedRoute.destination.icao}</span>
-                      </div>
-                      <p className="mt-1 text-[9px] leading-4 text-slate-500">
-                        {untrackedRoute.origin.municipality || untrackedRoute.origin.name} → {untrackedRoute.destination.municipality || untrackedRoute.destination.name}
-                      </p>
+                  {!untrackedLoading && (untrackedRoute?.itineraryKind === 'plausible' || untrackedProfile) && (
+                    <div className="mt-2.5 border border-white/[0.08] bg-white/[0.02] p-2.5">
+                      <FlightSummary
+                        flight={untrackedFound?.aircraft ?? null}
+                        route={untrackedRoute}
+                        profile={untrackedProfile}
+                      />
                     </div>
                   )}
                   {!untrackedLoading && !untrackedFound && (
@@ -1986,7 +2169,7 @@ export function AirTrafficApp() {
             <span>Rise / descend</span><span className="flex gap-1"><Key>SPACE</Key><Key>CTRL</Key></span>
             <span>Move faster</span><span className="flex gap-1"><Key>SHIFT</Key></span>
           </div>
-          <div className="mt-4 border-t border-white/[0.08] pt-3"><div className="mb-2 flex justify-between"><span className="telemetry-label">Flight speed</span><span className="font-mono text-[9px] text-cyan-200">{flySpeed[0].toFixed(2)} u/s</span></div><Slider min={0.15} max={2.5} step={0.05} value={flySpeed} onValueChange={(value) => setFlySpeed(toSliderTuple(value))} /></div>
+          <div className="mt-4 border-t border-white/[0.08] pt-3"><div className="mb-2 flex justify-between"><span className="telemetry-label">Flight speed</span><span className="font-mono text-[9px] text-cyan-200">{flySpeed.toFixed(2)} u/s</span></div><Slider min={0} max={1} step={0.01} value={flyThrottle} onValueChange={(value) => setFlyThrottle(toSliderTuple(value))} /><div className="mt-1.5 flex justify-between font-mono text-[8px] tracking-wider text-slate-600"><span>CRAWL</span><span>SHIFT FOR ×3</span><span>DASH</span></div></div>
         </div>
       )}
 
@@ -2130,17 +2313,19 @@ export function AirTrafficApp() {
           </div>
           <div className="grid grid-cols-3 gap-x-4 gap-y-4 border-b border-white/[0.08] p-4 lg:grid-cols-2 lg:gap-y-5">
             <Metric label="ICAO24" value={selected.id.toUpperCase()} />
-            {selected.registration
-              ? <Metric label="REGISTRATION" value={selected.registration} />
+            {selectedRegistration
+              ? <Metric label="REGISTRATION" value={selectedRegistration} />
               : <Metric label="ORIGIN" value={selected.country} />}
-            {selected.model
-              ? <Metric label="AIRCRAFT" value={selected.model} />
+            {selectedModel
+              ? <Metric label="AIRCRAFT" value={selectedModel} />
               : <Metric label="CATEGORY" value={categoryLabels[selected.category] ?? `Category ${selected.category}`} />}
             <Metric label="BARO ALTITUDE" value={formatNumber(selected.altitude * 3.28084)} suffix="ft" /><Metric label="GROUND SPEED" value={Math.round(selected.speed * 1.94384)} suffix="kt" /><Metric label="HEADING" value={Math.round(selected.heading)} suffix="°" />
             <Metric label="VERTICAL RATE" value={`${selected.verticalRate >= 0 ? '+' : ''}${Math.round(selected.verticalRate * 196.85)}`} suffix="ft/min" /><Metric label="SQUAWK" value={selected.squawk ?? '—'} /><Metric label="POSITION" value={sourceLabels[selected.positionSource] ?? `SRC ${selected.positionSource}`} />
           </div>
           <div className="min-h-0 flex-1 overflow-y-auto p-4">
-            <div className="flex items-center justify-between"><p className="telemetry-label">Position telemetry</p><span className="font-mono text-[9px] text-lime-200">{lastContactAge}s AGO</span></div>
+            <FlightSummary flight={selected} route={route} profile={selectedProfile} loading={routeLoading} />
+
+            <div className="mt-5 flex items-center justify-between border-t border-white/[0.08] pt-4"><p className="telemetry-label">Position telemetry</p><span className="font-mono text-[9px] text-lime-200">{lastContactAge}s AGO</span></div>
             <div className="mt-3 grid grid-cols-2 gap-2 font-mono text-[9px] tracking-wider text-slate-500"><div className="border border-white/[0.08] bg-[#02080d]/60 p-2"><span>LAT</span><p className="mt-1 text-xs text-slate-200">{selected.lat.toFixed(5)}°</p></div><div className="border border-white/[0.08] bg-[#02080d]/60 p-2"><span>LON</span><p className="mt-1 text-xs text-slate-200">{selected.lon.toFixed(5)}°</p></div></div>
             <p className="mt-3 text-[10px] leading-4 text-slate-500">Live identity and movement data come from the aircraft transponder network.</p>
 
@@ -2169,25 +2354,15 @@ export function AirTrafficApp() {
 
             <div className="mt-5 border-t border-white/[0.08] pt-4">
               <div className="flex items-center justify-between"><p className="telemetry-label">Route intelligence</p><Route className="size-3.5 text-violet-300" /></div>
-              {routeLoading && <p className="mt-2 font-mono text-[9px] tracking-wider text-slate-500">RESOLVING ITINERARY…</p>}
-              {!routeLoading && route?.itineraryKind === 'plausible' && route.origin && route.destination && (
-                <div className="mt-2 space-y-2.5">
-                  {route.airline && <p className="text-xs text-slate-300">{route.airline}</p>}
-                  <div className="flex items-center gap-2 font-mono text-[11px] text-white">
-                    <span className="border border-lime-200/30 bg-lime-200/[0.06] px-1.5 py-0.5 text-lime-200">{route.origin.iata || route.origin.icao}</span>
-                    <ArrowRight className="size-3 text-slate-500" />
-                    <span className="border border-orange-200/30 bg-orange-200/[0.06] px-1.5 py-0.5 text-orange-200">{route.destination.iata || route.destination.icao}</span>
-                  </div>
-                  <div className="grid grid-cols-2 gap-2 text-[10px] text-slate-500">
-                    <div className="flex items-start gap-1.5"><MapPin className="mt-0.5 size-3 shrink-0 text-lime-200/70" /><span>{route.origin.municipality || route.origin.name}, {route.origin.country}</span></div>
-                    <div className="flex items-start gap-1.5"><MapPin className="mt-0.5 size-3 shrink-0 text-orange-200/70" /><span>{route.destination.municipality || route.destination.name}, {route.destination.country}</span></div>
-                  </div>
-                  <p className="text-[9px] leading-4 text-slate-600">Dashed line is a plausible schedule-based route, not a confirmed flight plan. Solid line is the observed track.</p>
+              {route?.origin && route.destination && (
+                <div className="mt-2.5 grid grid-cols-2 gap-2 text-[10px] text-slate-500">
+                  <div className="flex items-start gap-1.5"><MapPin className="mt-0.5 size-3 shrink-0 text-lime-200/70" /><span>{route.origin.name}, {route.origin.country}</span></div>
+                  <div className="flex items-start gap-1.5"><MapPin className="mt-0.5 size-3 shrink-0 text-orange-200/70" /><span>{route.destination.name}, {route.destination.country}</span></div>
                 </div>
               )}
-              {!routeLoading && (!route || route.itineraryKind === 'unavailable') && (
-                <p className="mt-2 text-[10px] leading-4 text-slate-500">No scheduled route matched this callsign.</p>
-              )}
+              <p className="mt-2.5 text-[9px] leading-4 text-slate-600">
+                Dashed line is a plausible schedule-based route, not a confirmed flight plan. Solid line is the observed track. Departure and arrival are derived from that track and the current ground speed, not from a published schedule.
+              </p>
             </div>
           </div>
           <div className="grid grid-cols-2 gap-2 border-t border-white/[0.08] p-3"><Button onClick={centerSelected} variant="outline" className="rounded-none border-white/10 bg-white/[0.025] font-mono text-[9px] tracking-wider text-slate-300 hover:bg-white/10"><Crosshair /> CENTER CLOSE</Button><Button onClick={() => setFollow((value) => !value)} className={`rounded-none font-mono text-[9px] font-semibold tracking-wider ${follow ? 'bg-amber-200 text-[#151003] hover:bg-amber-100' : 'bg-lime-200 text-[#0a1304] hover:bg-lime-100'}`}><LocateFixed /> {follow ? 'STOP FOLLOW' : 'FOLLOW PLANE'}</Button></div>

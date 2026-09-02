@@ -13,6 +13,7 @@ type Airport = {
 
 type RouteResponse = {
   callsign: string;
+  callsignIata: string | null;
   airline: string | null;
   origin: Airport | null;
   destination: Airport | null;
@@ -50,6 +51,7 @@ type AdsbAirport = {
 type AdsbDbRoute = {
   response?: {
     flightroute?: {
+      callsign_iata?: string;
       airline?: { name?: string } | null;
       origin?: AdsbAirport;
       destination?: AdsbAirport;
@@ -133,6 +135,7 @@ export async function GET(request: NextRequest) {
   const destination = airport(rawItinerary?.destination);
   const body: RouteResponse = {
     callsign,
+    callsignIata: rawItinerary?.callsign_iata ?? null,
     airline: rawItinerary?.airline?.name ?? null,
     origin,
     destination,
