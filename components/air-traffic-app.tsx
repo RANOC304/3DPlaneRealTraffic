@@ -122,8 +122,64 @@ type FeedResponse = {
   refreshAfter: number;
   nextRefreshAt: number;
   count: number;
-  aircraft: Aircraft[];
+  aircraft: AircraftWire[];
 };
+
+type AircraftWire = [
+  id: string,
+  callsign: string,
+  country: string,
+  lat: number,
+  lon: number,
+  altitude: number,
+  onGround: boolean,
+  speed: number,
+  heading: number,
+  verticalRate: number,
+  positionTime: number,
+  lastContact: number,
+  squawk: string | null,
+  positionSource: number,
+  category: number,
+];
+
+function decodeAircraft([
+  id,
+  callsign,
+  country,
+  lat,
+  lon,
+  altitude,
+  onGround,
+  speed,
+  heading,
+  verticalRate,
+  positionTime,
+  lastContact,
+  squawk,
+  positionSource,
+  category,
+]: AircraftWire): Aircraft {
+  return {
+    id,
+    callsign,
+    country,
+    lat,
+    lon,
+    altitude,
+    geoAltitude: null,
+    onGround,
+    speed,
+    heading,
+    verticalRate,
+    positionTime,
+    lastContact,
+    squawk,
+    spi: false,
+    positionSource,
+    category,
+  };
+}
 
 type FeedState = 'connecting' | 'live' | 'preview';
 type FlightStateFilter = 'airborne' | 'ground' | 'all';
@@ -482,7 +538,7 @@ function useAircraftFeed(refreshKey: number) {
           throw new Error('error' in data ? data.error : 'Live feed unavailable');
         }
         if (cancelled) return;
-        setAircraft(data.aircraft);
+        setAircraft(data.aircraft.map(decodeAircraft));
         setMeta({ mode: data.mode, sourceTimestamp: data.sourceTimestamp, refreshAfter: data.refreshAfter });
         setState('live');
         setError(null);
@@ -808,17 +864,19 @@ function useNetworkAircraft(enabled: boolean, globalSweep: boolean, cameraPositi
   return { aircraft, sources };
 }
 
-function useCountryGeo() {
+function useCountryGeo(enabled: boolean) {
   const [geo, setGeo] = useState<CountryGeoJson | null>(null);
 
   useEffect(() => {
+    if (!enabled || geo) return;
+
     let cancelled = false;
     fetch('/data/countries.geojson', { cache: 'force-cache' })
       .then((response) => response.json() as Promise<CountryGeoJson>)
       .then((data) => { if (!cancelled) setGeo(data); })
       .catch(() => {});
     return () => { cancelled = true; };
-  }, []);
+  }, [enabled, geo]);
 
   return geo;
 }
@@ -1942,7 +2000,7 @@ export function AirTrafficApp() {
   const { lists: favoriteLists, setLists: setFavoriteLists } = useFavoriteLists();
   const [activeListIds, setActiveListIds] = useState<string[]>([]);
   const [newListName, setNewListName] = useState('');
-  const countryGeo = useCountryGeo();
+  const countryGeo = useCountryGeo(showCountries);
   const { route, loading: routeLoading } = useFlightRoute(selected);
   const selectedProfile = useAircraftProfile(selected?.id ?? null);
   useEffect(() => {

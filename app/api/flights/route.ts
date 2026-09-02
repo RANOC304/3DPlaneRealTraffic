@@ -32,25 +32,25 @@ type FlightResponse = {
   refreshAfter: number;
   nextRefreshAt: number;
   count: number;
-  aircraft: Array<{
-    id: string;
-    callsign: string;
-    country: string;
-    lat: number;
-    lon: number;
-    altitude: number;
-    geoAltitude: number | null;
-    onGround: boolean;
-    speed: number;
-    heading: number;
-    verticalRate: number;
-    positionTime: number;
-    lastContact: number;
-    squawk: string | null;
-    spi: boolean;
-    positionSource: number;
-    category: number;
-  }>;
+  // This endpoint is consumed only by the visualizer. A tuple avoids repeating
+  // fifteen property names thousands of times in every global snapshot.
+  aircraft: Array<[
+    id: string,
+    callsign: string,
+    country: string,
+    lat: number,
+    lon: number,
+    altitude: number,
+    onGround: boolean,
+    speed: number,
+    heading: number,
+    verticalRate: number,
+    positionTime: number,
+    lastContact: number,
+    squawk: string | null,
+    positionSource: number,
+    category: number,
+  ]>;
 };
 
 let tokenCache: TokenCache = null;
@@ -107,30 +107,28 @@ async function fetchSnapshot(): Promise<FlightResponse> {
   }
 
   const raw = (await response.json()) as { time: number; states: OpenSkyState[] | null };
-  const aircraft = (raw.states ?? []).flatMap((state) => {
+  const aircraft = (raw.states ?? []).flatMap((state): FlightResponse['aircraft'] => {
     const lon = state[5];
     const lat = state[6];
     if (lon === null || lat === null) return [];
 
-    return [{
-      id: state[0],
-      callsign: state[1]?.trim() || state[0].toUpperCase(),
-      country: state[2] || 'Unknown',
+    return [[
+      state[0],
+      state[1]?.trim() || state[0].toUpperCase(),
+      state[2] || 'Unknown',
       lat,
       lon,
-      altitude: state[7] ?? state[13] ?? 0,
-      geoAltitude: state[13],
-      onGround: state[8],
-      speed: state[9] ?? 0,
-      heading: state[10] ?? 0,
-      verticalRate: state[11] ?? 0,
-      positionTime: state[3] ?? state[4],
-      lastContact: state[4],
-      squawk: state[14],
-      spi: state[15],
-      positionSource: state[16],
-      category: state[17] ?? 0,
-    }];
+      state[7] ?? state[13] ?? 0,
+      state[8],
+      state[9] ?? 0,
+      state[10] ?? 0,
+      state[11] ?? 0,
+      state[3] ?? state[4],
+      state[4],
+      state[14],
+      state[16],
+      state[17] ?? 0,
+    ]];
   });
 
   const authenticated = Boolean(token);

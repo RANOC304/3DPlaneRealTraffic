@@ -1,5 +1,5 @@
-import { AirTrafficApp } from '@/components/air-traffic-app';
+import { AirTrafficLoader } from '@/components/air-traffic-loader';
 
 export default function Home() {
-  return <AirTrafficApp />;
+  return <AirTrafficLoader />;
 }
