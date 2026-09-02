@@ -1,6 +1,6 @@
 'use client';
 
-import { Canvas, type ThreeEvent, useFrame, useThree } from '@react-three/fiber';
+import { Canvas, useFrame, useThree } from '@react-three/fiber';
 import { Line, OrbitControls, PointerLockControls, Stars, useTexture } from '@react-three/drei';
 import {
   Activity,
@@ -48,13 +48,11 @@ import {
   Euler,
   Float32BufferAttribute,
   InstancedMesh,
-  type Intersection,
   type MeshBasicMaterial,
   MeshStandardMaterial,
   Object3D,
   PerspectiveCamera,
   Quaternion,
-  type Raycaster,
   SRGBColorSpace,
   Vector3,
 } from 'three';
@@ -968,23 +966,20 @@ function AircraftInstances({
   selectedId,
   predictive,
   motionScale,
-  onSelect,
 }: {
   aircraft: Aircraft[];
   variant: AircraftVariant;
   selectedId?: string;
   predictive: boolean;
   motionScale: number;
-  onSelect: (flight: Aircraft) => void;
 }) {
-  const { camera, size } = useThree();
+  const { camera } = useThree();
   const ref = useRef<InstancedMesh>(null);
   const dummy = useMemo(() => new Object3D(), []);
   const orientation = useMemo(() => new Quaternion(), []);
   const radial = useMemo(() => new Vector3(), []);
   const headingRotation = useMemo(() => new Quaternion(), []);
   const targetPosition = useMemo(() => new Vector3(), []);
-  const rayOffset = useMemo(() => new Vector3(), []);
   const smoothedPositions = useRef(new Map<string, Vector3>());
   const smoothedOrientations = useRef(new Map<string, Quaternion>());
   const geometry = useMemo(() => createFleetAircraftGeometry(variant), [variant]);
@@ -1062,47 +1057,12 @@ function AircraftInstances({
     updateMatrices(preciseNowSeconds(), delta);
   });
 
-  // Pointing at an aircraft, rather than hitting its handful of pixels. Each
-  // aircraft claims a disc of `selectionPixelRadius` around it on screen, and
-  // whichever of those discs the cursor falls in nearest the camera is the hit —
-  // so a click lands on the aircraft it was aimed at from orbit as readily as
-  // from a few hundred metres away.
-  const raycast = useCallback((raycaster: Raycaster, intersects: Intersection[]) => {
-    const mesh = ref.current;
-    const view = raycaster.camera as PerspectiveCamera | undefined;
-    if (!mesh || !view?.isPerspectiveCamera) return;
-    const { origin, direction } = raycaster.ray;
-    // Half the frustum height one unit ahead, divided by the viewport: the world
-    // size of a single pixel at unit depth, so the pick radius grows with range.
-    const worldPerPixel = (2 * Math.tan((view.fov * degrees) / 2)) / Math.max(1, size.height);
-
-    for (let index = 0; index < drawn; index++) {
-      const position = smoothedPositions.current.get(aircraft[index].id);
-      if (!position) continue;
-      rayOffset.subVectors(position, origin);
-      const depth = rayOffset.dot(direction);
-      if (depth <= 0) continue;
-      const reach = selectionPixelRadius * worldPerPixel * depth;
-      if (rayOffset.lengthSq() - depth * depth > reach * reach) continue;
-      if (occludedByGlobe(origin, rayOffset)) continue;
-      intersects.push({ distance: depth, point: position.clone(), object: mesh, instanceId: index });
-    }
-  }, [aircraft, drawn, rayOffset, size.height]);
-
   return (
-    <group
-      onClick={(event: ThreeEvent<MouseEvent>) => {
-        event.stopPropagation();
-        if (event.instanceId !== undefined) onSelect(aircraft[event.instanceId]);
-      }}
-      onPointerOver={() => { document.body.style.cursor = 'pointer'; }}
-      onPointerOut={() => { document.body.style.cursor = 'default'; }}
-    >
+    <group>
       <instancedMesh
         ref={ref}
         args={[undefined, undefined, capacity]}
         frustumCulled={false}
-        raycast={raycast}
       >
         <primitive object={geometry} attach="geometry" />
         <primitive object={material} attach="material" />
@@ -1125,6 +1085,103 @@ function AircraftFleet(props: Omit<Parameters<typeof AircraftInstances>[0], 'air
       ))}
     </>
   );
+}
+
+/**
+ * Aircraft picking deliberately lives on the canvas itself instead of R3F's
+ * interactive-object registry. Instanced meshes are rebuilt when a fleet bucket
+ * outgrows its GPU buffer; a native canvas listener remains valid across those
+ * rebuilds and can always match the click against the positions on screen.
+ */
+function AircraftPicker({
+  aircraft,
+  active,
+  predictive,
+  motionScale,
+  onSelect,
+}: {
+  aircraft: Aircraft[];
+  active: boolean;
+  predictive: boolean;
+  motionScale: number;
+  onSelect: (flight: Aircraft) => void;
+}) {
+  const { camera, gl } = useThree();
+
+  useEffect(() => {
+    if (!active) return;
+    const canvas = gl.domElement;
+    const worldPosition = new Vector3();
+    const cameraOffset = new Vector3();
+    const projected = new Vector3();
+    const viewDirection = new Vector3();
+    let pointerStart: { x: number; y: number } | null = null;
+
+    const onPointerDown = (event: MouseEvent) => {
+      if (event.button === 0) pointerStart = { x: event.clientX, y: event.clientY };
+    };
+
+    const onPointerUp = (event: MouseEvent) => {
+      const start = pointerStart;
+      pointerStart = null;
+      if (!start || event.button !== 0) return;
+      // Orbiting the globe is a drag, not an aircraft selection.
+      if (Math.hypot(event.clientX - start.x, event.clientY - start.y) > 5) return;
+
+      const bounds = canvas.getBoundingClientRect();
+      const pointerX = ((event.clientX - bounds.left) / bounds.width) * 2 - 1;
+      const pointerY = -((event.clientY - bounds.top) / bounds.height) * 2 + 1;
+      const timestamp = preciseNowSeconds();
+      const perspective = camera as PerspectiveCamera;
+      const worldHeightAtUnitDepth = 2 * Math.tan((perspective.fov * degrees) / 2);
+      camera.getWorldDirection(viewDirection).normalize();
+      let match: Aircraft | null = null;
+      let bestPixels = Number.POSITIVE_INFINITY;
+      let bestRange = Number.POSITIVE_INFINITY;
+
+      for (const flight of aircraft) {
+        globePosition(flight, timestamp, predictive, 0, worldPosition, motionScale);
+        cameraOffset.subVectors(worldPosition, camera.position);
+        if (occludedByGlobe(camera.position, cameraOffset)) continue;
+        const depth = cameraOffset.dot(viewDirection);
+        if (depth <= 0) continue;
+
+        projected.copy(worldPosition).project(camera);
+        if (projected.z < -1 || projected.z > 1) continue;
+        const pixelX = ((projected.x - pointerX) * bounds.width) / 2;
+        const pixelY = ((projected.y - pointerY) * bounds.height) / 2;
+        const pixelDistance = pixelX * pixelX + pixelY * pixelY;
+        const range = cameraOffset.lengthSq();
+        const distanceScale = Math.min(6, Math.max(1, Math.sqrt(range) / 4.5));
+        const modelScale = distanceScale * aircraftSizeFactor * (flight.onGround ? 0.78 : 1);
+        const apparentSpan = (fleetWingSpan[aircraftVariant(flight.category)] * modelScale * bounds.height)
+          / (worldHeightAtUnitDepth * depth);
+        // Far away, every plane gets a forgiving 13 px target. Up close the
+        // clickable area expands with the model on screen, so its wings and
+        // fuselage remain clickable instead of only its mathematical origin.
+        const pickRadius = Math.max(selectionPixelRadius, apparentSpan * 0.68);
+        if (pixelDistance > pickRadius * pickRadius) continue;
+        if (pixelDistance > bestPixels || (pixelDistance === bestPixels && range >= bestRange)) continue;
+        match = flight;
+        bestPixels = pixelDistance;
+        bestRange = range;
+      }
+
+      if (match) onSelect(match);
+    };
+
+    const clearPointer = () => { pointerStart = null; };
+    canvas.addEventListener('mousedown', onPointerDown);
+    canvas.addEventListener('click', onPointerUp);
+    canvas.addEventListener('mouseleave', clearPointer);
+    return () => {
+      canvas.removeEventListener('mousedown', onPointerDown);
+      canvas.removeEventListener('click', onPointerUp);
+      canvas.removeEventListener('mouseleave', clearPointer);
+    };
+  }, [active, aircraft, camera, gl, motionScale, onSelect, predictive]);
+
+  return null;
 }
 
 // Tail and cheatline markings. Kept inside the yellow family so an airline is
@@ -1605,7 +1662,8 @@ function GlobeScene({
       <pointLight position={[-4, -1, -3]} intensity={2.1} color="#0a4f7c" />
       <Suspense fallback={null}><Earth /></Suspense>
       {showCountries && countryGeo && <CountryBorders geo={countryGeo} />}
-      <AircraftFleet aircraft={aircraft} selectedId={selected?.id} predictive={predictive} motionScale={motionScale} onSelect={onSelect} />
+      <AircraftFleet aircraft={aircraft} selectedId={selected?.id} predictive={predictive} motionScale={motionScale} />
+      <AircraftPicker aircraft={aircraft} active={!flyMode} predictive={predictive} motionScale={motionScale} onSelect={onSelect} />
       {selected && <SelectedAircraft key={selected.id} flight={selected} predictive={predictive} paths={paths} motionScale={motionScale} />}
       {selected && route && (
         <Suspense fallback={null}><FlightRoutePath key={`${selected.id}-route`} route={route} /></Suspense>
@@ -1975,11 +2033,11 @@ export function AirTrafficApp() {
     ].slice(0, 12));
   }, [untrackedFound]);
 
-  const selectFlight = (flight: Aircraft) => {
+  const selectFlight = useCallback((flight: Aircraft) => {
     setSelected(flight);
     setFollow(false);
     setSearchFocused(false);
-  };
+  }, []);
 
   const createFavoriteList = () => {
     const name = newListName.trim();
