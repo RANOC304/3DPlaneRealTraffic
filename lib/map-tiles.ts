@@ -31,8 +31,8 @@ import {
 
 export type MapTile = { zoom: number; x: number; y: number; key: string };
 
-const tileTemplate = process.env.NEXT_PUBLIC_SATELLITE_TILE_URL
-  ?? 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}';
+const tileTemplate = process.env.NEXT_PUBLIC_SATELLITE_TILE_URL?.trim()
+  || 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}';
 
 /** Whole-globe coverage that stays mounted, so no camera move can bare the map. */
 export const baseMapZoom = 2;

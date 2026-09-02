@@ -57,9 +57,9 @@ let tokenCache: TokenCache = null;
 let flightCache: FlightCache = null;
 let inflightSnapshot: Promise<FlightResponse> | null = null;
 
-async function getToken() {
-  const clientId = process.env.OPENSKY_CLIENT_ID;
-  const clientSecret = process.env.OPENSKY_CLIENT_SECRET;
+async function getToken(): Promise<string | null> {
+  const clientId = process.env.OPENSKY_CLIENT_ID?.trim();
+  const clientSecret = process.env.OPENSKY_CLIENT_SECRET?.trim();
 
   if (!clientId || !clientSecret) return null;
   if (tokenCache && tokenCache.expiresAt > Date.now() + 60_000) return tokenCache.token;
@@ -70,32 +70,61 @@ async function getToken() {
     client_secret: clientSecret,
   });
 
-  const response = await fetch(
-    'https://auth.opensky-network.org/auth/realms/opensky-network/protocol/openid-connect/token',
-    {
-      method: 'POST',
-      headers: { 'content-type': 'application/x-www-form-urlencoded' },
-      body,
-      signal: AbortSignal.timeout(15_000),
-    },
-  );
+  try {
+    const response = await fetch(
+      'https://auth.opensky-network.org/auth/realms/opensky-network/protocol/openid-connect/token',
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/x-www-form-urlencoded' },
+        body,
+        signal: AbortSignal.timeout(15_000),
+      },
+    );
 
-  if (!response.ok) throw new Error(`OpenSky authentication failed (${response.status})`);
-  const data = (await response.json()) as { access_token: string; expires_in?: number };
-  tokenCache = {
-    token: data.access_token,
-    expiresAt: Date.now() + Math.max(120, data.expires_in ?? 1800) * 1000,
-  };
-  return tokenCache.token;
+    if (!response.ok) return null;
+    const data = (await response.json()) as { access_token?: string; expires_in?: number };
+    if (!data.access_token) return null;
+
+    tokenCache = {
+      token: data.access_token,
+      expiresAt: Date.now() + Math.max(120, data.expires_in ?? 1800) * 1000,
+    };
+    return tokenCache.token;
+  } catch {
+    return null;
+  }
 }
 
 async function fetchSnapshot(): Promise<FlightResponse> {
   const token = await getToken();
-  const response = await fetch('https://opensky-network.org/api/states/all?extended=1', {
-    headers: token ? { authorization: `Bearer ${token}` } : undefined,
-    cache: 'no-store',
-    signal: AbortSignal.timeout(22_000),
-  });
+  let authenticated = Boolean(token);
+  const requestStates = (accessToken: string | null) => fetch(
+    'https://opensky-network.org/api/states/all?extended=1',
+    {
+      headers: accessToken ? { authorization: `Bearer ${accessToken}` } : undefined,
+      cache: 'no-store',
+      signal: AbortSignal.timeout(22_000),
+    },
+  );
+
+  let response: Response;
+  try {
+    response = await requestStates(token);
+  } catch (error) {
+    if (!token) throw error;
+    tokenCache = null;
+    authenticated = false;
+    response = await requestStates(null);
+  }
+
+  // A rejected authenticated request can be caused by an expired token, an
+  // exhausted account allowance, or provider-side auth trouble. Retry once
+  // without credentials so the globe remains live at the anonymous allowance.
+  if (!response.ok && token) {
+    tokenCache = null;
+    authenticated = false;
+    response = await requestStates(null);
+  }
 
   if (!response.ok) {
     const retryAfter = response.headers.get('x-rate-limit-retry-after-seconds');
@@ -131,9 +160,8 @@ async function fetchSnapshot(): Promise<FlightResponse> {
     ]];
   });
 
-  const authenticated = Boolean(token);
-  // A global snapshot costs four credits. Ninety seconds stays below the
-  // free authenticated daily allowance while anonymous mode needs 15 minutes.
+  // A global snapshot costs four credits. Ninety seconds stays below the free
+  // authenticated allowance; anonymous access is paced to its smaller bucket.
   const refreshAfter = authenticated ? 90 : 900;
   const expiresAt = Date.now() + refreshAfter * 1000;
   const body: FlightResponse = {
