@@ -27,6 +27,8 @@ type FlightCache = { body: FlightResponse; expiresAt: number } | null;
 type FlightResponse = {
   source: 'opensky';
   mode: 'anonymous' | 'authenticated';
+  stale?: boolean;
+  warning?: string;
   sourceTimestamp: number;
   receivedAt: number;
   refreshAfter: number;
@@ -56,6 +58,9 @@ type FlightResponse = {
 let tokenCache: TokenCache = null;
 let flightCache: FlightCache = null;
 let inflightSnapshot: Promise<FlightResponse> | null = null;
+let nextRefreshAttemptAt = 0;
+
+const retryDelayMs = 60_000;
 
 function isVercelRuntime() {
   return process.env.VERCEL === '1' || Boolean(process.env.VERCEL_ENV);
@@ -173,7 +178,23 @@ async function fetchSnapshot(): Promise<FlightResponse> {
   };
 
   flightCache = { body, expiresAt };
+  nextRefreshAttemptAt = 0;
   return body;
+}
+
+function refreshSnapshot() {
+  inflightSnapshot ??= fetchSnapshot().finally(() => { inflightSnapshot = null; });
+  return inflightSnapshot;
+}
+
+function unavailableMessage(error: unknown) {
+  if (error instanceof DOMException && (error.name === 'TimeoutError' || error.name === 'AbortError')) {
+    return 'OpenSky is taking longer than expected; retrying automatically';
+  }
+  if (error instanceof Error && /aborted|timeout/i.test(error.message)) {
+    return 'OpenSky is taking longer than expected; retrying automatically';
+  }
+  return error instanceof Error ? error.message : 'The live aircraft feed is temporarily unavailable';
 }
 
 export async function GET() {
@@ -186,12 +207,42 @@ export async function GET() {
     });
   }
 
+  // Never throw away a valid global snapshot merely because the next OpenSky
+  // refresh is slow. Return the last positions immediately and revalidate once
+  // in the background; aircraft prediction continues moving them from their
+  // source timestamps while this request recovers.
+  if (flightCache) {
+    if (Date.now() >= nextRefreshAttemptAt) {
+      nextRefreshAttemptAt = Date.now() + retryDelayMs;
+      void refreshSnapshot().catch(() => {
+        // The stale snapshot remains usable. A later request retries after the
+        // backoff instead of making every browser wait on the same timeout.
+      });
+    }
+
+    return NextResponse.json(
+      {
+        ...flightCache.body,
+        stale: true,
+        warning: 'OpenSky refresh delayed; showing the latest received positions',
+        refreshAfter: retryDelayMs / 1000,
+        nextRefreshAt: Math.ceil((Date.now() + retryDelayMs) / 1000),
+      },
+      {
+        headers: {
+          'cache-control': 'private, no-store',
+          'x-skytrace-cache': 'stale',
+          warning: '110 - "Response is stale"',
+        },
+      },
+    );
+  }
+
   try {
     // Collapse concurrent misses into one upstream snapshot. Anonymous access
     // allows only ~100 global requests a day, so several clients refreshing at
     // the same moment must not each spend one.
-    inflightSnapshot ??= fetchSnapshot().finally(() => { inflightSnapshot = null; });
-    const body = await inflightSnapshot;
+    const body = await refreshSnapshot();
 
     return NextResponse.json(body, {
       headers: {
@@ -204,9 +255,9 @@ export async function GET() {
   } catch (error) {
     return NextResponse.json(
       {
-        error: error instanceof Error ? error.message : 'The live aircraft feed is temporarily unavailable',
+        error: unavailableMessage(error),
       },
-      { status: 503 },
+      { status: 503, headers: { 'retry-after': String(retryDelayMs / 1000) } },
     );
   }
 }

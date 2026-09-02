@@ -31,6 +31,16 @@ import {
 
 export type MapTile = { zoom: number; x: number; y: number; key: string };
 
+export type TerrainTile = {
+  zoom: number;
+  x: number;
+  y: number;
+  key: string;
+  width: number;
+  height: number;
+  elevations: Int16Array;
+};
+
 const tileTemplate = process.env.NEXT_PUBLIC_SATELLITE_TILE_URL?.trim()
   || 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}';
 
@@ -38,26 +48,48 @@ const tileTemplate = process.env.NEXT_PUBLIC_SATELLITE_TILE_URL?.trim()
 export const baseMapZoom = 2;
 /** Deepest level the imagery service still answers with real detail. */
 export const maxMapZoom = 19;
+/** Mapzen's 256 px Terrarium pyramid ends at level 15. */
+export const maxTerrainZoom = 15;
 
 const degrees = Math.PI / 180;
 // Six is the classic per-host browser limit; the tile services speak HTTP/2, so
 // a wider pipe still fills the screen faster without starving the API calls.
 const maxConcurrentLoads = 12;
 const textureBudget = 1200;
+const maxConcurrentTerrainLoads = 6;
+const terrainBudget = 280;
+// Terrain is exaggerated enough to remain readable in an oblique view while
+// retaining real DEM heights and a safe relationship with aircraft altitude.
+const terrainExaggeration = 2.5;
+const earthRadiusMeters = 6_371_000;
 
 type TileStatus = 'idle' | 'loading' | 'ready' | 'empty' | 'failed';
 type TileEntry = { texture: Texture | null; status: TileStatus; usedAt: number };
 
 const entries = new Map<string, TileEntry>();
 const listeners = new Set<() => void>();
+const terrainListeners = new Set<() => void>();
 const liveKeys = new Set<string>();
 const loader = new TextureLoader();
 loader.setCrossOrigin('anonymous');
+
+type TerrainStatus = 'idle' | 'loading' | 'ready' | 'empty' | 'failed';
+type TerrainEntry = {
+  status: TerrainStatus;
+  usedAt: number;
+  tile: TerrainTile | null;
+};
+
+const terrainEntries = new Map<string, TerrainEntry>();
+const liveTerrainKeys = new Set<string>();
+let terrainQueue: Array<{ zoom: number; x: number; y: number; key: string }> = [];
+let activeTerrainLoads = 0;
 
 let queue: MapTile[] = [];
 let activeLoads = 0;
 let anisotropy = 1;
 let notifyHandle: ReturnType<typeof setTimeout> | null = null;
+let terrainNotifyHandle: ReturnType<typeof setTimeout> | null = null;
 
 export function mapTileKey(zoom: number, x: number, y: number) {
   return `${zoom}/${x}/${y}`;
@@ -105,6 +137,13 @@ export function subscribeToMapTiles(listener: () => void) {
   };
 }
 
+export function subscribeToTerrainTiles(listener: () => void) {
+  terrainListeners.add(listener);
+  return () => {
+    terrainListeners.delete(listener);
+  };
+}
+
 // Tiles land in bursts. Coalescing the notifications keeps a screenful of
 // arrivals to one React pass instead of eighty.
 function notify() {
@@ -113,6 +152,14 @@ function notify() {
     notifyHandle = null;
     listeners.forEach((listener) => listener());
   }, 80);
+}
+
+function notifyTerrain() {
+  if (terrainNotifyHandle !== null) return;
+  terrainNotifyHandle = setTimeout(() => {
+    terrainNotifyHandle = null;
+    terrainListeners.forEach((listener) => listener());
+  }, 100);
 }
 
 function entryFor(key: string) {
@@ -166,6 +213,196 @@ function evictColdTextures() {
     entry.texture?.dispose();
     entries.delete(key);
   }
+}
+
+function terrainEntryFor(key: string) {
+  let entry = terrainEntries.get(key);
+  if (!entry) {
+    entry = { status: 'idle', usedAt: 0, tile: null };
+    terrainEntries.set(key, entry);
+  }
+  return entry;
+}
+
+function evictColdTerrain() {
+  if (terrainEntries.size <= terrainBudget) return;
+  const cold = [...terrainEntries.entries()]
+    .filter(([key, entry]) => entry.status === 'ready' && !liveTerrainKeys.has(key))
+    .sort((first, second) => first[1].usedAt - second[1].usedAt);
+
+  for (const [key] of cold.slice(0, terrainEntries.size - terrainBudget)) {
+    terrainEntries.delete(key);
+  }
+}
+
+function terrainRequestFor(tile: MapTile) {
+  const zoom = Math.min(tile.zoom, maxTerrainZoom);
+  const scale = 2 ** (tile.zoom - zoom);
+  const x = Math.floor(tile.x / scale);
+  const y = Math.floor(tile.y / scale);
+  return { zoom, x, y, key: mapTileKey(zoom, x, y) };
+}
+
+function decodeTerrainImage(
+  request: { zoom: number; x: number; y: number; key: string },
+  image: HTMLImageElement,
+) {
+  const canvas = document.createElement('canvas');
+  canvas.width = image.naturalWidth;
+  canvas.height = image.naturalHeight;
+  const context = canvas.getContext('2d', { willReadFrequently: true });
+  if (!context) return null;
+  context.drawImage(image, 0, 0);
+  const pixels = context.getImageData(0, 0, canvas.width, canvas.height).data;
+  const elevations = new Int16Array(canvas.width * canvas.height);
+
+  for (let pixel = 0, sample = 0; pixel < pixels.length; pixel += 4, sample++) {
+    // Terrarium stores metres as R * 256 + G + B / 256 - 32768. Red zero is
+    // its no-data marker. Bathymetry is kept on the sea-level shell because
+    // this mesh represents visible land, not the sea floor.
+    const elevation = pixels[pixel] === 0
+      ? 0
+      : pixels[pixel] * 256 + pixels[pixel + 1] + pixels[pixel + 2] / 256 - 32768;
+    elevations[sample] = Math.round(Math.max(0, Math.min(9000, elevation)));
+  }
+
+  return {
+    ...request,
+    width: canvas.width,
+    height: canvas.height,
+    elevations,
+  } satisfies TerrainTile;
+}
+
+function pumpTerrain() {
+  while (activeTerrainLoads < maxConcurrentTerrainLoads && terrainQueue.length > 0) {
+    const request = terrainQueue.shift()!;
+    const entry = terrainEntryFor(request.key);
+    if (entry.status !== 'idle' && entry.status !== 'failed') continue;
+
+    entry.status = 'loading';
+    activeTerrainLoads++;
+    const image = new Image();
+    image.decoding = 'async';
+    image.onload = () => {
+      activeTerrainLoads--;
+      try {
+        entry.tile = decodeTerrainImage(request, image);
+        entry.status = entry.tile ? 'ready' : 'empty';
+      } catch {
+        entry.status = 'failed';
+      }
+      entry.usedAt = performance.now();
+      evictColdTerrain();
+      pumpTerrain();
+      notify();
+      notifyTerrain();
+    };
+    image.onerror = () => {
+      activeTerrainLoads--;
+      entry.status = 'empty';
+      entry.usedAt = performance.now();
+      pumpTerrain();
+      notify();
+      notifyTerrain();
+    };
+    image.src = `/api/terrain/${request.zoom}/${request.x}/${request.y}`;
+  }
+}
+
+/** Queue the DEM tiles that correspond to the currently visible imagery. */
+export function requestTerrainTiles(wanted: MapTile[]) {
+  const requests = new Map<string, ReturnType<typeof terrainRequestFor>>();
+  for (const tile of wanted) {
+    let request = terrainRequestFor(tile);
+    while (request.zoom >= baseMapZoom) {
+      requests.set(request.key, request);
+      if (request.zoom === baseMapZoom) break;
+      const zoom = request.zoom - 1;
+      const x = Math.floor(request.x / 2);
+      const y = Math.floor(request.y / 2);
+      request = { zoom, x, y, key: mapTileKey(zoom, x, y) };
+    }
+  }
+
+  liveTerrainKeys.clear();
+  for (const key of requests.keys()) liveTerrainKeys.add(key);
+
+  terrainQueue = [...requests.values()]
+    .filter((request) => {
+      const status = terrainEntries.get(request.key)?.status;
+      return status === undefined || status === 'idle' || status === 'failed';
+    })
+    .sort((first, second) => first.zoom - second.zoom);
+  pumpTerrain();
+}
+
+/** The sharpest loaded DEM tile covering this imagery tile. */
+export function resolveTerrainTile(tile: MapTile): TerrainTile | null {
+  let request = terrainRequestFor(tile);
+  while (request.zoom >= baseMapZoom) {
+    const entry = terrainEntries.get(request.key);
+    if (entry?.status === 'ready' && entry.tile) {
+      entry.usedAt = performance.now();
+      return entry.tile;
+    }
+    const zoom = request.zoom - 1;
+    const x = Math.floor(request.x / 2);
+    const y = Math.floor(request.y / 2);
+    request = { zoom, x, y, key: mapTileKey(zoom, x, y) };
+  }
+  return null;
+}
+
+function sampleTerrain(terrain: TerrainTile, globalX: number, globalY: number) {
+  const count = 2 ** terrain.zoom;
+  const localX = globalX * count - terrain.x;
+  const localY = globalY * count - terrain.y;
+  const pixelX = Math.max(0, Math.min(terrain.width - 1, localX * terrain.width - 0.5));
+  const pixelY = Math.max(0, Math.min(terrain.height - 1, localY * terrain.height - 0.5));
+  const x0 = Math.floor(pixelX);
+  const y0 = Math.floor(pixelY);
+  const x1 = Math.min(terrain.width - 1, x0 + 1);
+  const y1 = Math.min(terrain.height - 1, y0 + 1);
+  const tx = pixelX - x0;
+  const ty = pixelY - y0;
+  const top = terrain.elevations[y0 * terrain.width + x0] * (1 - tx)
+    + terrain.elevations[y0 * terrain.width + x1] * tx;
+  const bottom = terrain.elevations[y1 * terrain.width + x0] * (1 - tx)
+    + terrain.elevations[y1 * terrain.width + x1] * tx;
+  return top * (1 - ty) + bottom * ty;
+}
+
+function terrainOffset(elevationMeters: number, baseRadius: number) {
+  return (elevationMeters / earthRadiusMeters) * baseRadius * terrainExaggeration;
+}
+
+/** Terrain-aware surface radius below a world-space camera position. */
+export function terrainSurfaceRadiusAtMercator(globalX: number, globalY: number, baseRadius: number) {
+  const normalizedX = ((globalX % 1) + 1) % 1;
+  const normalizedY = Math.max(0, Math.min(1 - Number.EPSILON, globalY));
+  for (let zoom = maxTerrainZoom; zoom >= baseMapZoom; zoom--) {
+    const count = 2 ** zoom;
+    const x = Math.min(count - 1, Math.floor(normalizedX * count));
+    const y = Math.min(count - 1, Math.floor(normalizedY * count));
+    const entry = terrainEntries.get(mapTileKey(zoom, x, y));
+    if (entry?.status !== 'ready' || !entry.tile) continue;
+    entry.usedAt = performance.now();
+    return baseRadius + terrainOffset(sampleTerrain(entry.tile, normalizedX, normalizedY), baseRadius);
+  }
+  return baseRadius;
+}
+
+/** Terrain-aware surface radius below a world-space camera position. */
+export function terrainSurfaceRadiusAt(point: Vector3, baseRadius: number) {
+  const length = point.length();
+  if (length < 1e-9) return baseRadius;
+  const latitude = Math.asin(point.y / length);
+  const longitude = Math.atan2(-point.z, point.x);
+  const globalX = longitude / (2 * Math.PI) + 0.5;
+  const limitedLatitude = Math.max(-85.05112878 * degrees, Math.min(85.05112878 * degrees, latitude));
+  const globalY = (1 - Math.asinh(Math.tan(limitedLatitude)) / Math.PI) / 2;
+  return terrainSurfaceRadiusAtMercator(globalX, globalY, baseRadius);
 }
 
 function pump() {
@@ -270,9 +507,14 @@ function tileCorner(zoom: number, x: number, y: number, radius: number, target: 
  * mesh chord sinks beneath the fallback globe underneath it, which is what used
  * to stipple the map with dark diamonds.
  */
-export function buildMapTileGeometry(tile: MapTile, radius: number, sourceZoom = tile.zoom) {
+export function buildMapTileGeometry(
+  tile: MapTile,
+  radius: number,
+  sourceZoom = tile.zoom,
+  terrain: TerrainTile | null = null,
+) {
   const tileCount = 2 ** tile.zoom;
-  const segments = Math.min(96, Math.max(2, Math.ceil(360 / tileCount)));
+  const segments = Math.min(96, Math.max(terrain ? 16 : 2, Math.ceil(360 / tileCount)));
   // When the imagery comes from an ancestor, the tile covers just a fraction of
   // it; baking that window into the UVs keeps the shared texture untouched, so
   // one cached tile can back any number of descendants at once.
@@ -293,7 +535,12 @@ export function buildMapTileGeometry(tile: MapTile, radius: number, sourceZoom =
     for (let column = 0; column <= segments; column++) {
       const columnProgress = column / segments;
       const lon = ((tile.x + columnProgress) / tileCount) * 360 - 180;
-      spherePoint(lat, lon, radius, point);
+      const globalX = (tile.x + columnProgress) / tileCount;
+      const globalY = (tile.y + rowProgress) / tileCount;
+      const surfaceRadius = terrain
+        ? radius + terrainOffset(sampleTerrain(terrain, globalX, globalY), radius)
+        : radius;
+      spherePoint(lat, lon, surfaceRadius, point);
       positions.push(point.x, point.y, point.z);
       uvs.push(uvOriginX + columnProgress * uvScale, uvOriginY + (1 - rowProgress) * uvScale);
     }
@@ -313,6 +560,7 @@ export function buildMapTileGeometry(tile: MapTile, radius: number, sourceZoom =
   geometry.setAttribute('position', new Float32BufferAttribute(positions, 3));
   geometry.setAttribute('uv', new Float32BufferAttribute(uvs, 2));
   geometry.setIndex(indices);
+  geometry.computeVertexNormals();
   geometry.computeBoundingSphere();
   return geometry;
 }
@@ -457,6 +705,7 @@ export function selectMapTiles(options: {
     first.tile.zoom - second.tile.zoom || first.distance - second.distance
   ));
   requestMapTiles(wanted.map((candidate) => candidate.tile));
+  requestTerrainTiles(drawn.map((candidate) => candidate.tile));
 
   liveKeys.clear();
   for (const candidate of drawn) liveKeys.add(candidate.tile.key);
