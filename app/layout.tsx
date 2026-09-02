@@ -18,6 +18,7 @@ export const metadata: Metadata = {
   metadataBase: new URL(siteUrl),
   title: 'Skytrace — Live 3D Air Traffic',
   description: 'Explore live global air traffic around a fully interactive 3D Earth.',
+  icons: { icon: '/favicon.svg' },
   openGraph: {
     title: 'Skytrace — Live 3D Air Traffic',
     description: 'Explore real aircraft around a fully interactive 3D Earth with free-flight camera controls.',
