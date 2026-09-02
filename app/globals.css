@@ -1,0 +1,88 @@
+@import 'tailwindcss';
+@import 'tw-animate-css';
+@import 'shadcn/tailwind.css';
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+  --color-ring: var(--ring);
+  --color-input: var(--input);
+  --color-border: var(--border);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-primary: var(--primary);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-muted: var(--muted);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-accent: var(--accent);
+  --radius-sm: 0;
+  --radius-md: 0;
+  --radius-lg: 0;
+  --radius-xl: 0;
+}
+
+:root {
+  --background: oklch(0.11 0.02 235);
+  --foreground: oklch(0.96 0.015 210);
+  --primary: oklch(0.87 0.13 199);
+  --primary-foreground: oklch(0.13 0.03 221);
+  --muted: oklch(0.19 0.025 227);
+  --muted-foreground: oklch(0.64 0.025 224);
+  --accent: oklch(0.25 0.04 219);
+  --accent-foreground: oklch(0.95 0.02 205);
+  --border: oklch(1 0 0 / 10%);
+  --input: oklch(1 0 0 / 12%);
+  --ring: oklch(0.87 0.13 199);
+}
+
+* {
+  border-color: var(--border);
+  scrollbar-color: rgb(52 77 92 / 0.7) transparent;
+  scrollbar-width: thin;
+}
+
+html,
+body {
+  min-height: 100%;
+  background: #02070c;
+}
+
+body {
+  margin: 0;
+  color: var(--foreground);
+  font-family: var(--font-geist-sans), Arial, Helvetica, sans-serif;
+}
+
+button,
+input { font: inherit; }
+button { cursor: pointer; }
+
+.telemetry-label {
+  font-family: var(--font-geist-mono), monospace;
+  font-size: 9px;
+  letter-spacing: 0.13em;
+  text-transform: uppercase;
+  color: rgb(100 116 139);
+}
+
+.scanlines {
+  background-image: repeating-linear-gradient(to bottom, transparent 0, transparent 3px, rgb(95 226 255 / 0.025) 4px);
+}
+
+.telemetry-grid {
+  background-image: linear-gradient(rgb(103 232 249 / 0.12) 1px, transparent 1px), linear-gradient(90deg, rgb(103 232 249 / 0.12) 1px, transparent 1px);
+  background-size: 22px 22px;
+}
+
+@media (max-width: 640px) { .scanlines { opacity: 0.08; } }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+  }
+}
