@@ -68,6 +68,7 @@ type TileEntry = { texture: Texture | null; status: TileStatus; usedAt: number }
 
 const entries = new Map<string, TileEntry>();
 const listeners = new Set<() => void>();
+const terrainListeners = new Set<() => void>();
 const liveKeys = new Set<string>();
 const loader = new TextureLoader();
 loader.setCrossOrigin('anonymous');
@@ -88,6 +89,7 @@ let queue: MapTile[] = [];
 let activeLoads = 0;
 let anisotropy = 1;
 let notifyHandle: ReturnType<typeof setTimeout> | null = null;
+let terrainNotifyHandle: ReturnType<typeof setTimeout> | null = null;
 
 export function mapTileKey(zoom: number, x: number, y: number) {
   return `${zoom}/${x}/${y}`;
@@ -135,6 +137,13 @@ export function subscribeToMapTiles(listener: () => void) {
   };
 }
 
+export function subscribeToTerrainTiles(listener: () => void) {
+  terrainListeners.add(listener);
+  return () => {
+    terrainListeners.delete(listener);
+  };
+}
+
 // Tiles land in bursts. Coalescing the notifications keeps a screenful of
 // arrivals to one React pass instead of eighty.
 function notify() {
@@ -143,6 +152,14 @@ function notify() {
     notifyHandle = null;
     listeners.forEach((listener) => listener());
   }, 80);
+}
+
+function notifyTerrain() {
+  if (terrainNotifyHandle !== null) return;
+  terrainNotifyHandle = setTimeout(() => {
+    terrainNotifyHandle = null;
+    terrainListeners.forEach((listener) => listener());
+  }, 100);
 }
 
 function entryFor(key: string) {
@@ -279,6 +296,7 @@ function pumpTerrain() {
       evictColdTerrain();
       pumpTerrain();
       notify();
+      notifyTerrain();
     };
     image.onerror = () => {
       activeTerrainLoads--;
@@ -286,6 +304,7 @@ function pumpTerrain() {
       entry.usedAt = performance.now();
       pumpTerrain();
       notify();
+      notifyTerrain();
     };
     image.src = `/api/terrain/${request.zoom}/${request.x}/${request.y}`;
   }

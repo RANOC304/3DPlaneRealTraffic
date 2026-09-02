@@ -44,6 +44,7 @@ import {
   BufferGeometry,
   CanvasTexture,
   Color,
+  DoubleSide,
   DynamicDrawUsage,
   Euler,
   Float32BufferAttribute,
@@ -83,8 +84,20 @@ import {
   resolveTerrainTile,
   selectMapTiles,
   subscribeToMapTiles,
+  subscribeToTerrainTiles,
   terrainSurfaceRadiusAt,
 } from '@/lib/map-tiles';
+import {
+  type StructureTile,
+  type StructureTileRequest,
+  buildStructureGeometry,
+  buildTreeInstances,
+  requestStructureTiles,
+  resolveStructureTile,
+  structureRequestsNear,
+  subscribeToStructureTiles,
+  worldPointToMercator,
+} from '@/lib/map-structures';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { NativeSelect, NativeSelectOption } from '@/components/ui/native-select';
@@ -758,6 +771,152 @@ function Earth() {
       <DetailedEarthMap />
       <Atmosphere />
     </group>
+  );
+}
+
+function StructureTileMesh({ tile }: { tile: StructureTile }) {
+  const geometry = useMemo(
+    () => buildStructureGeometry(tile, mapSurfaceRadius),
+    [tile],
+  );
+  useEffect(() => () => geometry?.dispose(), [geometry]);
+  if (!geometry) return null;
+
+  return (
+    <mesh geometry={geometry} renderOrder={30} frustumCulled={false}>
+      <meshStandardMaterial
+        vertexColors
+        side={DoubleSide}
+        roughness={0.88}
+        metalness={0.04}
+        polygonOffset
+        polygonOffsetFactor={-1}
+        polygonOffsetUnits={-1}
+      />
+    </mesh>
+  );
+}
+
+function ForestTile({ tile }: { tile: StructureTile }) {
+  const crowns = useRef<InstancedMesh>(null);
+  const trunks = useRef<InstancedMesh>(null);
+  const trees = useMemo(
+    () => buildTreeInstances(tile, mapSurfaceRadius),
+    [tile],
+  );
+  const dummy = useMemo(() => new Object3D(), []);
+  const radial = useMemo(() => new Vector3(), []);
+  const orientation = useMemo(() => new Quaternion(), []);
+
+  useLayoutEffect(() => {
+    const crownMesh = crowns.current;
+    const trunkMesh = trunks.current;
+    if (!crownMesh || !trunkMesh) return;
+
+    trees.forEach((tree, index) => {
+      radial.copy(tree.position).normalize();
+      orientation.setFromUnitVectors(upVector, radial);
+
+      const crownHeight = tree.height * 0.8;
+      dummy.position.copy(tree.position).addScaledVector(radial, tree.height * 0.58);
+      dummy.quaternion.copy(orientation);
+      dummy.scale.set(tree.radius, crownHeight / 2, tree.radius);
+      dummy.updateMatrix();
+      crownMesh.setMatrixAt(index, dummy.matrix);
+      crownMesh.setColorAt(index, tree.colour);
+
+      const trunkHeight = tree.height * 0.42;
+      dummy.position.copy(tree.position).addScaledVector(radial, trunkHeight / 2);
+      dummy.scale.set(tree.radius * 0.16, trunkHeight / 2, tree.radius * 0.16);
+      dummy.updateMatrix();
+      trunkMesh.setMatrixAt(index, dummy.matrix);
+    });
+    crownMesh.instanceMatrix.needsUpdate = true;
+    trunkMesh.instanceMatrix.needsUpdate = true;
+    if (crownMesh.instanceColor) crownMesh.instanceColor.needsUpdate = true;
+  }, [dummy, orientation, radial, trees]);
+
+  if (trees.length === 0) return null;
+  return (
+    <group>
+      <instancedMesh ref={trunks} args={[undefined, undefined, trees.length]} frustumCulled={false} renderOrder={31}>
+        <cylinderGeometry args={[1, 1, 2, 5]} />
+        <meshStandardMaterial color="#644b35" roughness={1} />
+      </instancedMesh>
+      <instancedMesh ref={crowns} args={[undefined, undefined, trees.length]} frustumCulled={false} renderOrder={32}>
+        <coneGeometry args={[1, 2, 7]} />
+        <meshStandardMaterial roughness={1} />
+      </instancedMesh>
+    </group>
+  );
+}
+
+function sameStructureRequests(current: StructureTileRequest[], next: StructureTileRequest[]) {
+  return current.length === next.length
+    && current.every((request, index) => request.key === next[index].key);
+}
+
+function DetailedStructures({ enabled }: { enabled: boolean }) {
+  const { camera } = useThree();
+  const [requests, setRequests] = useState<StructureTileRequest[]>([]);
+  const [tileRevision, setTileRevision] = useState(0);
+  const [terrainRevision, setTerrainRevision] = useState(0);
+  const lastCheck = useRef(0);
+  const viewDirection = useMemo(() => new Vector3(), []);
+  const groundPoint = useMemo(() => new Vector3(), []);
+
+  useEffect(() => subscribeToStructureTiles(() => setTileRevision((value) => value + 1)), []);
+  useEffect(() => subscribeToTerrainTiles(() => setTerrainRevision((value) => value + 1)), []);
+
+  useFrame(() => {
+    const now = performance.now();
+    if (now - lastCheck.current < 350) return;
+    lastCheck.current = now;
+    if (!enabled) {
+      requestStructureTiles([]);
+      setRequests((current) => (current.length === 0 ? current : []));
+      return;
+    }
+
+    const groundRadius = terrainSurfaceRadiusAt(camera.position, mapSurfaceRadius);
+    const altitude = Math.max(0, camera.position.length() - groundRadius);
+    // Buildings are smaller than a pixel above roughly 20 km and would cost far
+    // more to decode than they contribute to an orbital view.
+    if (altitude > 0.008) {
+      requestStructureTiles([]);
+      setRequests((current) => (current.length === 0 ? current : []));
+      return;
+    }
+
+    camera.getWorldDirection(viewDirection).normalize();
+    const projection = camera.position.dot(viewDirection);
+    const discriminant = projection * projection
+      - (camera.position.lengthSq() - earthRadius * earthRadius);
+    const distance = discriminant >= 0 ? -projection - Math.sqrt(discriminant) : -1;
+    if (distance > 0) groundPoint.copy(camera.position).addScaledVector(viewDirection, distance);
+    else groundPoint.copy(camera.position).setLength(earthRadius);
+
+    const focus = worldPointToMercator(groundPoint);
+    const radius = altitude > 0.0015 ? 2 : 1;
+    const next = structureRequestsNear(focus.x, focus.y, radius);
+    requestStructureTiles(next);
+    setRequests((current) => (sameStructureRequests(current, next) ? current : next));
+  });
+
+  void tileRevision;
+  const loaded = requests
+    .map(resolveStructureTile)
+    .filter((tile): tile is StructureTile => tile !== null);
+
+  return (
+    <>
+      {loaded.map((tile) => (
+        <group key={`${tile.key}:${terrainRevision}`}>
+          <StructureTileMesh tile={tile} />
+          <ForestTile tile={tile} />
+        </group>
+      ))}
+    </>
   );
 }
 
@@ -1724,6 +1883,7 @@ function GlobeScene({
   focusRequest,
   resetRequest,
   showCountries,
+  showStructures,
   countryGeo,
   motionScale,
   onFlyMode,
@@ -1743,6 +1903,7 @@ function GlobeScene({
   focusRequest: number;
   resetRequest: number;
   showCountries: boolean;
+  showStructures: boolean;
   countryGeo: CountryGeoJson | null;
   motionScale: number;
   onFlyMode: (active: boolean) => void;
@@ -1759,6 +1920,7 @@ function GlobeScene({
       <directionalLight position={[5, 2, 4]} intensity={3.15} color={new Color('#d9f4ff')} />
       <pointLight position={[-4, -1, -3]} intensity={2.1} color="#0a4f7c" />
       <Suspense fallback={null}><Earth /></Suspense>
+      <DetailedStructures enabled={showStructures} />
       {showCountries && countryGeo && <CountryBorders geo={countryGeo} />}
       <AircraftFleet aircraft={aircraft} selectedId={selected?.id} predictive={predictive} motionScale={motionScale} />
       <AircraftPicker aircraft={aircraft} active={!flyMode} predictive={predictive} motionScale={motionScale} onSelect={onSelect} />
@@ -2032,6 +2194,7 @@ export function AirTrafficApp() {
   const [predictive, setPredictive] = useState(true);
   const [paths, setPaths] = useState(true);
   const [showCountries, setShowCountries] = useState(false);
+  const [showStructures, setShowStructures] = useState(true);
   const [motionSpeed, setMotionSpeed] = useState([1]);
   const [flyMode, setFlyMode] = useState(false);
   const [follow, setFollow] = useState(false);
@@ -2236,6 +2399,7 @@ export function AirTrafficApp() {
             focusRequest={focusRequest}
             resetRequest={resetRequest}
             showCountries={showCountries}
+            showStructures={showStructures}
             countryGeo={countryGeo}
             motionScale={motionSpeed[0]}
             onFlyMode={setFlyMode}
@@ -2451,6 +2615,7 @@ export function AirTrafficApp() {
             <p className="telemetry-label mb-3">Visualization</p>
             <label className="flex items-center justify-between py-1.5 text-xs text-slate-300"><span>Predictive movement</span><Switch checked={predictive} onCheckedChange={setPredictive} className="data-checked:bg-cyan-300" /></label>
             <label className="flex items-center justify-between py-1.5 text-xs text-slate-300"><span>Selected flight path</span><Switch checked={paths} onCheckedChange={setPaths} className="data-checked:bg-cyan-300" /></label>
+            <div className="flex items-center justify-between py-1.5 text-xs text-slate-300"><span>3D buildings, bridges & forests</span><Switch checked={showStructures} onCheckedChange={setShowStructures} className="data-checked:bg-cyan-300" aria-label="Toggle 3D buildings, bridges, and forests" /></div>
             <label className="flex items-center justify-between py-1.5 text-xs text-slate-300"><span>Extra country outlines</span><Switch checked={showCountries} onCheckedChange={setShowCountries} className="data-checked:bg-cyan-300" /></label>
             <label className="flex items-center justify-between py-1.5 text-xs text-slate-300"><span>Extended ADS-B networks</span><Switch checked={useNetworks} onCheckedChange={setUseNetworks} className="data-checked:bg-cyan-300" /></label>
             {useNetworks && (
@@ -2577,10 +2742,19 @@ export function AirTrafficApp() {
         >
           Terrain © Mapzen + providers
         </a>
+        <span className="mx-1.5 text-slate-600">·</span>
+        <a
+          href="https://openfreemap.org"
+          target="_blank"
+          rel="noreferrer"
+          className="transition hover:text-cyan-200"
+        >
+          3D objects: OpenFreeMap © OpenMapTiles · Data from OpenStreetMap
+        </a>
       </div>
 
       <footer className="pointer-events-none absolute inset-x-0 bottom-0 z-30 flex h-10 items-center border-t border-white/[0.08] bg-[#030a10]/82 px-4 font-mono text-[9px] tracking-wider text-slate-600 backdrop-blur-xl sm:px-6">
-        <span className="flex items-center gap-2"><Radio className={`size-3 ${feedState === 'live' ? 'text-cyan-300' : 'text-amber-300'}`} /> {feedState === 'live' ? 'OPENSKY LIVE NETWORK' : feedState === 'connecting' ? 'OPENSKY CONNECTION PENDING' : feedState === 'stale' ? 'OPENSKY REFRESH DELAYED' : 'OPENSKY OFFLINE'}</span><span className="mx-4 hidden h-3 w-px bg-white/10 sm:block" /><span className="hidden sm:inline">UTC {utc}</span><span className="ml-4 hidden text-slate-700 xl:inline">EARTH / 3D TERRAIN + SATELLITE</span>
+        <span className="flex items-center gap-2"><Radio className={`size-3 ${feedState === 'live' ? 'text-cyan-300' : 'text-amber-300'}`} /> {feedState === 'live' ? 'OPENSKY LIVE NETWORK' : feedState === 'connecting' ? 'OPENSKY CONNECTION PENDING' : feedState === 'stale' ? 'OPENSKY REFRESH DELAYED' : 'OPENSKY OFFLINE'}</span><span className="mx-4 hidden h-3 w-px bg-white/10 sm:block" /><span className="hidden sm:inline">UTC {utc}</span><span className="ml-4 hidden text-slate-700 xl:inline">EARTH / FULL 3D SCENE</span>
         <div className="ml-auto flex items-center gap-4"><span className="hidden items-center gap-1.5 md:flex"><Activity className="size-3 text-lime-300" /> {motionSpeed[0] === 1 ? 'TRUE-SPEED LIVE MOTION' : `${motionSpeed[0]}× TIME-LAPSE MOTION`}</span><span className="hidden items-center gap-1.5 xl:flex">{meta ? `${meta.refreshAfter}s SOURCE SYNC` : 'CONNECTING'}</span><span className="hidden items-center gap-1.5 lg:flex"><ArrowUpFromLine className="size-3" /> SPACE</span><span className="hidden items-center gap-1.5 lg:flex"><ArrowDownToLine className="size-3" /> CTRL</span><span className="flex items-center gap-1.5"><Gauge className="size-3" /> 60 FPS</span></div>
       </footer>
     </main>

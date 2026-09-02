@@ -74,7 +74,9 @@ function notify() {
 
 export function subscribeToStructureTiles(listener: () => void) {
   listeners.add(listener);
-  return () => listeners.delete(listener);
+  return () => {
+    listeners.delete(listener);
+  };
 }
 
 function entryFor(key: string) {
@@ -102,7 +104,8 @@ function parseStructureTile(request: StructureTileRequest, bytes: ArrayBuffer): 
   const vectorTile = new VectorTile(new PbfReader(bytes));
   const buildingLayer = vectorTile.layers.building;
   const landcoverLayer = vectorTile.layers.landcover;
-  const extent = buildingLayer?.extent ?? landcoverLayer?.extent ?? 4096;
+  const transportationLayer = vectorTile.layers.transportation;
+  const extent = buildingLayer?.extent ?? landcoverLayer?.extent ?? transportationLayer?.extent ?? 4096;
   const buildings: BuildingPolygon[] = [];
   const woods: TilePolygon[] = [];
 
@@ -122,6 +125,27 @@ function parseStructureTile(request: StructureTileRequest, bytes: ArrayBuffer): 
           minimumHeight,
           colour,
           seed: (feature.id ?? index) * 31 + part,
+        });
+      }
+    }
+  }
+
+  if (transportationLayer) {
+    for (let index = 0; index < transportationLayer.length; index++) {
+      const feature = transportationLayer.feature(index);
+      if (
+        feature.type !== 3
+        || (feature.properties.class !== 'bridge' && feature.properties.brunnel !== 'bridge')
+      ) continue;
+      const layer = Math.max(1, asNumber(feature.properties.layer, 1));
+      const minimumHeight = 3 + layer * 3.5;
+      for (const [part, rings] of copyPolygons(feature.loadGeometry()).entries()) {
+        buildings.push({
+          rings,
+          minimumHeight,
+          height: minimumHeight + 1.4,
+          colour: '#8d969a',
+          seed: 900_000 + (feature.id ?? index) * 41 + part,
         });
       }
     }
