@@ -57,11 +57,17 @@ let tokenCache: TokenCache = null;
 let flightCache: FlightCache = null;
 let inflightSnapshot: Promise<FlightResponse> | null = null;
 
-async function getToken(): Promise<string | null> {
+function isVercelRuntime() {
+  return process.env.VERCEL === '1' || Boolean(process.env.VERCEL_ENV);
+}
+
+async function getToken(): Promise<string> {
   const clientId = process.env.OPENSKY_CLIENT_ID?.trim();
   const clientSecret = process.env.OPENSKY_CLIENT_SECRET?.trim();
 
-  if (!clientId || !clientSecret) return null;
+  if (!clientId || !clientSecret) {
+    throw new Error('OpenSky API credentials are required outside Vercel');
+  }
   if (tokenCache && tokenCache.expiresAt > Date.now() + 60_000) return tokenCache.token;
 
   const body = new URLSearchParams({
@@ -81,23 +87,29 @@ async function getToken(): Promise<string | null> {
       },
     );
 
-    if (!response.ok) return null;
+    if (!response.ok) {
+      throw new Error(`OpenSky rejected the API credentials (${response.status})`);
+    }
     const data = (await response.json()) as { access_token?: string; expires_in?: number };
-    if (!data.access_token) return null;
+    if (!data.access_token) throw new Error('OpenSky returned no OAuth access token');
 
     tokenCache = {
       token: data.access_token,
       expiresAt: Date.now() + Math.max(120, data.expires_in ?? 1800) * 1000,
     };
     return tokenCache.token;
-  } catch {
-    return null;
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith('OpenSky ')) throw error;
+    throw new Error('OpenSky authentication is unavailable');
   }
 }
 
 async function fetchSnapshot(): Promise<FlightResponse> {
-  const token = await getToken();
-  let authenticated = Boolean(token);
+  // Vercel's shared cloud egress is unreliable with OpenSky authentication.
+  // Local development uses the account allowance; Vercel deliberately uses the
+  // anonymous IP allowance and never attempts to transmit the API credentials.
+  const token = isVercelRuntime() ? null : await getToken();
+  const authenticated = Boolean(token);
   const requestStates = (accessToken: string | null) => fetch(
     'https://opensky-network.org/api/states/all?extended=1',
     {
@@ -107,24 +119,7 @@ async function fetchSnapshot(): Promise<FlightResponse> {
     },
   );
 
-  let response: Response;
-  try {
-    response = await requestStates(token);
-  } catch (error) {
-    if (!token) throw error;
-    tokenCache = null;
-    authenticated = false;
-    response = await requestStates(null);
-  }
-
-  // A rejected authenticated request can be caused by an expired token, an
-  // exhausted account allowance, or provider-side auth trouble. Retry once
-  // without credentials so the globe remains live at the anonymous allowance.
-  if (!response.ok && token) {
-    tokenCache = null;
-    authenticated = false;
-    response = await requestStates(null);
-  }
+  const response = await requestStates(token);
 
   if (!response.ok) {
     const retryAfter = response.headers.get('x-rate-limit-retry-after-seconds');

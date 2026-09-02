@@ -181,7 +181,7 @@ function decodeAircraft([
   };
 }
 
-type FeedState = 'connecting' | 'live' | 'preview';
+type FeedState = 'connecting' | 'live' | 'error';
 type FlightStateFilter = 'airborne' | 'ground' | 'all';
 
 type RouteAirport = {
@@ -327,43 +327,6 @@ function toSliderTuple(value: number | readonly number[]): number[] {
 const nowSeconds = () => Math.floor(Date.now() / 1000);
 const preciseNowSeconds = () => Date.now() / 1000;
 const formatNumber = (value: number) => Math.round(value).toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',');
-
-const previewFlights: Aircraft[] = [
-  ['4ca7b3', 'RYR8VX', 'Ireland', 51.47, -0.45, 10668, 231, 112, 4, 3],
-  ['a2b8f4', 'UAL923', 'United States', 48.1, -18.2, 11582, 249, 71, 0, 5],
-  ['3c65a8', 'DLH441', 'Germany', 52.1, 9.9, 10120, 219, 94, -2, 3],
-  ['896318', 'UAE2', 'United Arab Emirates', 41.6, 27.2, 11887, 252, 298, 1, 5],
-  ['780a12', 'CPA255', 'Hong Kong', 37.9, 72.4, 10972, 243, 285, 0, 5],
-  ['ab3f12', 'AAL100', 'United States', 41.1, -57.2, 11278, 246, 82, -1, 5],
-  ['7c6b2a', 'QFA9', 'Australia', -12.5, 112.6, 12192, 257, 301, 0, 5],
-  ['e48b21', 'TAM8084', 'Brazil', -18.4, -35.7, 10363, 235, 42, 2, 3],
-  ['008a2d', 'SAA204', 'South Africa', -28.2, 27.6, 11430, 248, 214, -1, 5],
-  ['86d8a1', 'ANA215', 'Japan', 39.5, 143.1, 9753, 225, 71, 2, 3],
-  ['02018c', 'RAM201', 'Morocco', 36.2, -9.8, 8847, 207, 194, -2, 3],
-  ['c81f21', 'ANZ1', 'New Zealand', -31.4, 169.8, 11980, 251, 224, 0, 5],
-  ['400ae2', 'BAW17', 'United Kingdom', 56.1, -31.2, 11010, 239, 264, 1, 5],
-  ['7502a1', 'MAS4', 'Malaysia', 17.3, 86.4, 10820, 242, 310, -1, 5],
-  ['06a1e3', 'QTR739', 'Qatar', 28.7, 54.1, 11630, 250, 288, 0, 5],
-  ['3446d1', 'IBE6251', 'Spain', 33.4, -22.8, 10240, 234, 251, 2, 3],
-] .map(([id, callsign, country, lat, lon, altitude, speed, heading, verticalRate, category]) => ({
-  id: id as string,
-  callsign: callsign as string,
-  country: country as string,
-  lat: lat as number,
-  lon: lon as number,
-  altitude: altitude as number,
-  geoAltitude: altitude as number,
-  onGround: false,
-  speed: speed as number,
-  heading: heading as number,
-  verticalRate: verticalRate as number,
-  positionTime: nowSeconds(),
-  lastContact: nowSeconds(),
-  squawk: null,
-  spi: false,
-  positionSource: 0,
-  category: category as number,
-}));
 
 const categoryLabels: Record<number, string> = {
   0: 'No category',
@@ -521,7 +484,7 @@ function globePosition(
 }
 
 function useAircraftFeed(refreshKey: number) {
-  const [aircraft, setAircraft] = useState<Aircraft[]>(previewFlights);
+  const [aircraft, setAircraft] = useState<Aircraft[]>([]);
   const [state, setState] = useState<FeedState>('connecting');
   const [error, setError] = useState<string | null>(null);
   const [meta, setMeta] = useState<Pick<FeedResponse, 'mode' | 'sourceTimestamp' | 'refreshAfter'> | null>(null);
@@ -550,7 +513,9 @@ function useAircraftFeed(refreshKey: number) {
         timer = setTimeout(load, Math.min(data.refreshAfter * 1000, Math.max(5_000, dueIn)));
       } catch (loadError) {
         if (cancelled) return;
-        setState('preview');
+        setAircraft([]);
+        setMeta(null);
+        setState('error');
         setError(loadError instanceof Error ? loadError.message : 'Live feed unavailable');
         timer = setTimeout(load, 60_000);
       }
@@ -1120,6 +1085,7 @@ function AircraftInstances({
       <instancedMesh
         ref={ref}
         args={[undefined, undefined, capacity]}
+        dispose={null}
         frustumCulled={false}
       >
         <primitive object={geometry} attach="geometry" />
@@ -1960,12 +1926,15 @@ export function AirTrafficApp() {
   const [refreshKey, setRefreshKey] = useState(0);
   const { aircraft: feedAircraft, state: feedState, error, meta } = useAircraftFeed(refreshKey);
   const [externalAircraft, setExternalAircraft] = useState<Aircraft[]>([]);
-  const [useNetworks, setUseNetworks] = useState(true);
+  const [useNetworks, setUseNetworks] = useState(false);
   const [globalSweep, setGlobalSweep] = useState(false);
   const [cameraPosition, setCameraPosition] = useState<[number, number, number]>([0, 0.3, 6.7]);
   const { aircraft: networkAircraft, sources: networkSources } = useNetworkAircraft(useNetworks, globalSweep, cameraPosition);
 
   const aircraft = useMemo(() => {
+    // OpenSky is the primary health signal. Optional network/search results must
+    // never leave aircraft on the globe when that primary feed is offline.
+    if (feedState !== 'live') return [];
     if (networkAircraft.length === 0 && externalAircraft.length === 0) return feedAircraft;
     // The same airframe can arrive from OpenSky and a community network at once;
     // keep whichever fix is newer so the globe shows the best available position.
@@ -1975,7 +1944,7 @@ export function AirTrafficApp() {
       if (!existing || flight.positionTime > existing.positionTime) merged.set(flight.id, flight);
     }
     return [...merged.values()];
-  }, [feedAircraft, networkAircraft, externalAircraft]);
+  }, [feedAircraft, feedState, networkAircraft, externalAircraft]);
   const [selected, setSelected] = useState<Aircraft | null>(null);
   const [filtersOpen, setFiltersOpen] = useState(true);
   const [helpOpen, setHelpOpen] = useState(false);
@@ -2012,10 +1981,10 @@ export function AirTrafficApp() {
 
   useEffect(() => {
     setSelected((current) => {
-      if (!current) return null;
+      if (!current || feedState !== 'live') return null;
       return aircraft.find((flight) => flight.id === current.id) ?? current;
     });
-  }, [aircraft]);
+  }, [aircraft, feedState]);
 
   useEffect(() => {
     const shortcut = (event: KeyboardEvent) => {
@@ -2191,7 +2160,7 @@ export function AirTrafficApp() {
         <div className="flex min-w-0 items-center gap-3">
           <div className="grid size-9 place-items-center border border-cyan-300/35 bg-cyan-300/[0.08] text-cyan-200"><Globe2 className="size-[18px]" /></div>
           <div>
-            <div className="flex items-center gap-2"><h1 className="font-semibold tracking-[0.16em] text-white">SKYTRACE</h1><span className={`rounded-sm border px-1.5 py-0.5 font-mono text-[8px] tracking-[0.18em] ${feedState === 'live' ? 'border-lime-200/20 bg-lime-200/[0.08] text-lime-200' : 'border-amber-200/20 bg-amber-200/[0.08] text-amber-200'}`}>{feedState === 'live' ? 'LIVE' : feedState === 'connecting' ? 'LINKING' : 'PREVIEW'}</span></div>
+            <div className="flex items-center gap-2"><h1 className="font-semibold tracking-[0.16em] text-white">SKYTRACE</h1><span className={`rounded-sm border px-1.5 py-0.5 font-mono text-[8px] tracking-[0.18em] ${feedState === 'live' ? 'border-lime-200/20 bg-lime-200/[0.08] text-lime-200' : 'border-amber-200/20 bg-amber-200/[0.08] text-amber-200'}`}>{feedState === 'live' ? 'LIVE' : feedState === 'connecting' ? 'LINKING' : 'OFFLINE'}</span></div>
             <p className="hidden font-mono text-[9px] tracking-[0.14em] text-slate-500 sm:block">GLOBAL AIRSPACE / 3D OPERATIONS</p>
           </div>
         </div>
@@ -2289,8 +2258,8 @@ export function AirTrafficApp() {
         </div>
       )}
 
-      {feedState === 'preview' && error && (
-        <div className="pointer-events-none absolute left-1/2 top-[78px] z-20 flex max-w-[calc(100%-32px)] -translate-x-1/2 items-center gap-2 border border-amber-300/20 bg-amber-300/[0.08] px-3 py-2 font-mono text-[9px] tracking-wider text-amber-100 backdrop-blur-xl"><AlertTriangle className="size-3.5 shrink-0" /><span className="truncate">PREVIEW DATA — {error}</span></div>
+      {feedState === 'error' && error && (
+        <div className="pointer-events-none absolute left-1/2 top-[78px] z-20 flex max-w-[calc(100%-32px)] -translate-x-1/2 items-center gap-2 border border-amber-300/20 bg-amber-300/[0.08] px-3 py-2 font-mono text-[9px] tracking-wider text-amber-100 backdrop-blur-xl"><AlertTriangle className="size-3.5 shrink-0" /><span className="truncate">LIVE DATA UNAVAILABLE — {error}</span></div>
       )}
 
       <aside className={`pointer-events-auto absolute bottom-14 left-3 top-[78px] z-10 flex w-[292px] flex-col border border-white/[0.09] bg-[#061018]/84 shadow-2xl shadow-black/40 backdrop-blur-xl transition-transform duration-300 sm:left-6 ${filtersOpen ? 'translate-x-0' : '-translate-x-[calc(100%+32px)]'}`}>
@@ -2508,7 +2477,7 @@ export function AirTrafficApp() {
       </a>
 
       <footer className="pointer-events-none absolute inset-x-0 bottom-0 z-30 flex h-10 items-center border-t border-white/[0.08] bg-[#030a10]/82 px-4 font-mono text-[9px] tracking-wider text-slate-600 backdrop-blur-xl sm:px-6">
-        <span className="flex items-center gap-2"><Radio className={`size-3 ${feedState === 'live' ? 'text-cyan-300' : 'text-amber-300'}`} /> {feedState === 'live' ? 'OPENSKY LIVE NETWORK' : 'OPENSKY CONNECTION PENDING'}</span><span className="mx-4 hidden h-3 w-px bg-white/10 sm:block" /><span className="hidden sm:inline">UTC {utc}</span><span className="ml-4 hidden text-slate-700 xl:inline">EARTH / SATELLITE IMAGERY</span>
+        <span className="flex items-center gap-2"><Radio className={`size-3 ${feedState === 'live' ? 'text-cyan-300' : 'text-amber-300'}`} /> {feedState === 'live' ? 'OPENSKY LIVE NETWORK' : feedState === 'connecting' ? 'OPENSKY CONNECTION PENDING' : 'OPENSKY OFFLINE'}</span><span className="mx-4 hidden h-3 w-px bg-white/10 sm:block" /><span className="hidden sm:inline">UTC {utc}</span><span className="ml-4 hidden text-slate-700 xl:inline">EARTH / SATELLITE IMAGERY</span>
         <div className="ml-auto flex items-center gap-4"><span className="hidden items-center gap-1.5 md:flex"><Activity className="size-3 text-lime-300" /> {motionSpeed[0] === 1 ? 'TRUE-SPEED LIVE MOTION' : `${motionSpeed[0]}× TIME-LAPSE MOTION`}</span><span className="hidden items-center gap-1.5 xl:flex">{meta ? `${meta.refreshAfter}s SOURCE SYNC` : 'CONNECTING'}</span><span className="hidden items-center gap-1.5 lg:flex"><ArrowUpFromLine className="size-3" /> SPACE</span><span className="hidden items-center gap-1.5 lg:flex"><ArrowDownToLine className="size-3" /> CTRL</span><span className="flex items-center gap-1.5"><Gauge className="size-3" /> 60 FPS</span></div>
       </footer>
     </main>
