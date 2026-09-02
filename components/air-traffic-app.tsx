@@ -80,8 +80,10 @@ import {
   configureMapTiles,
   isMapTileReady,
   resolveMapTile,
+  resolveTerrainTile,
   selectMapTiles,
   subscribeToMapTiles,
+  terrainSurfaceRadiusAt,
 } from '@/lib/map-tiles';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -117,6 +119,8 @@ type Aircraft = {
 type FeedResponse = {
   source: 'opensky';
   mode: 'anonymous' | 'authenticated';
+  stale?: boolean;
+  warning?: string;
   sourceTimestamp: number;
   receivedAt: number;
   refreshAfter: number;
@@ -181,7 +185,7 @@ function decodeAircraft([
   };
 }
 
-type FeedState = 'connecting' | 'live' | 'preview';
+type FeedState = 'connecting' | 'live' | 'stale' | 'error';
 type FlightStateFilter = 'airborne' | 'ground' | 'all';
 
 type RouteAirport = {
@@ -328,43 +332,6 @@ const nowSeconds = () => Math.floor(Date.now() / 1000);
 const preciseNowSeconds = () => Date.now() / 1000;
 const formatNumber = (value: number) => Math.round(value).toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',');
 
-const previewFlights: Aircraft[] = [
-  ['4ca7b3', 'RYR8VX', 'Ireland', 51.47, -0.45, 10668, 231, 112, 4, 3],
-  ['a2b8f4', 'UAL923', 'United States', 48.1, -18.2, 11582, 249, 71, 0, 5],
-  ['3c65a8', 'DLH441', 'Germany', 52.1, 9.9, 10120, 219, 94, -2, 3],
-  ['896318', 'UAE2', 'United Arab Emirates', 41.6, 27.2, 11887, 252, 298, 1, 5],
-  ['780a12', 'CPA255', 'Hong Kong', 37.9, 72.4, 10972, 243, 285, 0, 5],
-  ['ab3f12', 'AAL100', 'United States', 41.1, -57.2, 11278, 246, 82, -1, 5],
-  ['7c6b2a', 'QFA9', 'Australia', -12.5, 112.6, 12192, 257, 301, 0, 5],
-  ['e48b21', 'TAM8084', 'Brazil', -18.4, -35.7, 10363, 235, 42, 2, 3],
-  ['008a2d', 'SAA204', 'South Africa', -28.2, 27.6, 11430, 248, 214, -1, 5],
-  ['86d8a1', 'ANA215', 'Japan', 39.5, 143.1, 9753, 225, 71, 2, 3],
-  ['02018c', 'RAM201', 'Morocco', 36.2, -9.8, 8847, 207, 194, -2, 3],
-  ['c81f21', 'ANZ1', 'New Zealand', -31.4, 169.8, 11980, 251, 224, 0, 5],
-  ['400ae2', 'BAW17', 'United Kingdom', 56.1, -31.2, 11010, 239, 264, 1, 5],
-  ['7502a1', 'MAS4', 'Malaysia', 17.3, 86.4, 10820, 242, 310, -1, 5],
-  ['06a1e3', 'QTR739', 'Qatar', 28.7, 54.1, 11630, 250, 288, 0, 5],
-  ['3446d1', 'IBE6251', 'Spain', 33.4, -22.8, 10240, 234, 251, 2, 3],
-] .map(([id, callsign, country, lat, lon, altitude, speed, heading, verticalRate, category]) => ({
-  id: id as string,
-  callsign: callsign as string,
-  country: country as string,
-  lat: lat as number,
-  lon: lon as number,
-  altitude: altitude as number,
-  geoAltitude: altitude as number,
-  onGround: false,
-  speed: speed as number,
-  heading: heading as number,
-  verticalRate: verticalRate as number,
-  positionTime: nowSeconds(),
-  lastContact: nowSeconds(),
-  squawk: null,
-  spi: false,
-  positionSource: 0,
-  category: category as number,
-}));
-
 const categoryLabels: Record<number, string> = {
   0: 'No category',
   1: 'No ADS-B category',
@@ -412,12 +379,43 @@ const selectionPixelRadius = 13;
 // ocean, so the throttle is exponential: the slider carries a 0-1 position and
 // every step of it is the same proportional change in speed. A linear scale
 // over this range would bury every usable slow speed in its first few pixels.
-const minimumFlySpeed = 0.01;
+const minimumFlySpeed = 0.001;
 const maximumFlySpeed = 6;
+const minimumOrbitSpeedMultiplier = 0.1;
+const minimumProximityMultiplier = 0.001;
+// The opening camera position is the upper sensitivity threshold: mouse-drag
+// controls use their original speed there, then slow proportionally with every
+// step closer to the globe. Zooming farther out never makes them faster.
+const proximityReferenceAltitude = Math.hypot(0, 0.3, 6.7) - earthRadius;
+const baseOrbitRotateSpeed = 0.48;
+const baseOrbitPanSpeed = 0.65;
+const flyYawSpeed = 1.2;
 
 /** Scene units per second for a 0-1 throttle position. */
 function flySpeedFor(throttle: number) {
   return minimumFlySpeed * (maximumFlySpeed / minimumFlySpeed) ** throttle;
+}
+
+/** Shared 0.1-1 speed range for mouse-driven orbit, pan, and zoom. */
+function orbitSpeedFor(throttle: number) {
+  return minimumOrbitSpeedMultiplier
+    * (1 / minimumOrbitSpeedMultiplier) ** throttle;
+}
+
+/**
+ * Close to the ground, the same scene-space movement covers far more of the
+ * visible map. Scale it by altitude so precision increases continuously with
+ * zoom instead of becoming uncontrollable over streets and airports.
+ */
+function proximitySpeedFor(altitude: number) {
+  return Math.min(1, Math.max(
+    minimumProximityMultiplier,
+    Math.max(altitude, minimumCameraAltitude) / proximityReferenceAltitude,
+  ));
+}
+
+function formatCameraSpeed(speed: number) {
+  return speed < 0.01 ? speed.toFixed(3) : speed.toFixed(2);
 }
 
 /** Smallest reusable instance buffer that can hold the current fleet bucket. */
@@ -521,7 +519,7 @@ function globePosition(
 }
 
 function useAircraftFeed(refreshKey: number) {
-  const [aircraft, setAircraft] = useState<Aircraft[]>(previewFlights);
+  const [aircraft, setAircraft] = useState<Aircraft[]>([]);
   const [state, setState] = useState<FeedState>('connecting');
   const [error, setError] = useState<string | null>(null);
   const [meta, setMeta] = useState<Pick<FeedResponse, 'mode' | 'sourceTimestamp' | 'refreshAfter'> | null>(null);
@@ -540,8 +538,8 @@ function useAircraftFeed(refreshKey: number) {
         if (cancelled) return;
         setAircraft(data.aircraft.map(decodeAircraft));
         setMeta({ mode: data.mode, sourceTimestamp: data.sourceTimestamp, refreshAfter: data.refreshAfter });
-        setState('live');
-        setError(null);
+        setState(data.stale ? 'stale' : 'live');
+        setError(data.stale ? (data.warning ?? 'OpenSky refresh delayed') : null);
         // Wake up when the server says the next snapshot is actually due, so a
         // new fix reaches the globe within seconds of existing. Polling on a
         // blind interval instead either re-downloads the same snapshot or lets
@@ -550,7 +548,9 @@ function useAircraftFeed(refreshKey: number) {
         timer = setTimeout(load, Math.min(data.refreshAfter * 1000, Math.max(5_000, dueIn)));
       } catch (loadError) {
         if (cancelled) return;
-        setState('preview');
+        // Keep the last real snapshot on screen during a transient refresh
+        // failure. Clearing it turns a short provider delay into an empty globe.
+        setState((current) => (current === 'live' || current === 'stale' ? 'stale' : 'error'));
         setError(loadError instanceof Error ? loadError.message : 'Live feed unavailable');
         timer = setTimeout(load, 60_000);
       }
@@ -633,10 +633,11 @@ function MapTileMesh({ tile }: { tile: MapTile }) {
   // Whatever imagery exists for this ground right now: its own if it has
   // arrived, otherwise the nearest ancestor's, so the tile is never a hole.
   const source = resolveMapTile(tile);
+  const terrain = resolveTerrainTile(tile);
   const sourceZoom = source?.zoom ?? tile.zoom;
   const geometry = useMemo(
-    () => buildMapTileGeometry(tile, mapSurfaceRadius, sourceZoom),
-    [sourceZoom, tile],
+    () => buildMapTileGeometry(tile, mapSurfaceRadius, sourceZoom, terrain),
+    [sourceZoom, terrain, tile],
   );
 
   useEffect(() => () => geometry.dispose(), [geometry]);
@@ -648,7 +649,17 @@ function MapTileMesh({ tile }: { tile: MapTile }) {
     // coarser one it is refining. The opaque globe underneath still occludes
     // everything on the far side.
     <mesh geometry={geometry} renderOrder={tile.zoom}>
-      <meshBasicMaterial map={source.texture} toneMapped={false} depthWrite={false} />
+      <meshStandardMaterial
+        map={source.texture}
+        color="#566466"
+        emissive="#ffffff"
+        emissiveMap={source.texture}
+        emissiveIntensity={0.72}
+        roughness={1}
+        metalness={0}
+        toneMapped={false}
+        depthWrite={false}
+      />
     </mesh>
   );
 }
@@ -1120,6 +1131,7 @@ function AircraftInstances({
       <instancedMesh
         ref={ref}
         args={[undefined, undefined, capacity]}
+        dispose={null}
         frustumCulled={false}
       >
         <primitive object={geometry} attach="geometry" />
@@ -1508,6 +1520,7 @@ function FlyMovement({ active, speed }: { active: boolean; speed: number }) {
   const right = useMemo(() => new Vector3(), []);
   const localUp = useMemo(() => new Vector3(), []);
   const thrust = useMemo(() => new Vector3(), []);
+  const orientation = useRef(new Euler(0, 0, 0, 'YXZ'));
 
   useEffect(() => {
     const down = (event: KeyboardEvent) => keys.current.add(event.code);
@@ -1536,7 +1549,19 @@ function FlyMovement({ active, speed }: { active: boolean; speed: number }) {
     if (!active) return;
     const delta = Math.min(rawDelta, 0.1);
     const held = keys.current;
-    const cruiseSpeed = speed * (held.has('ShiftLeft') || held.has('ShiftRight') ? 3 : 1);
+    const groundRadius = terrainSurfaceRadiusAt(camera.position, mapSurfaceRadius);
+    const altitude = Math.max(camera.position.length() - groundRadius, minimumCameraAltitude);
+    const precisionSpeed = proximitySpeedFor(altitude);
+    const cruiseSpeed = speed * precisionSpeed
+      * (held.has('ShiftLeft') || held.has('ShiftRight') ? 3 : 1);
+
+    const turn = Number(held.has('KeyQ') || held.has('KeyA') || held.has('ArrowLeft'))
+      - Number(held.has('KeyD') || held.has('ArrowRight'));
+    if (turn !== 0) {
+      orientation.current.setFromQuaternion(camera.quaternion, 'YXZ');
+      orientation.current.y += turn * flyYawSpeed * delta;
+      camera.quaternion.setFromEuler(orientation.current);
+    }
 
     camera.getWorldDirection(forward).normalize();
     right.crossVectors(forward, camera.up).normalize();
@@ -1545,8 +1570,6 @@ function FlyMovement({ active, speed }: { active: boolean; speed: number }) {
     thrust.set(0, 0, 0);
     if (held.has('KeyZ') || held.has('KeyW') || held.has('ArrowUp')) thrust.addScaledVector(forward, 1);
     if (held.has('KeyS') || held.has('ArrowDown')) thrust.addScaledVector(forward, -1);
-    if (held.has('KeyQ') || held.has('KeyA') || held.has('ArrowLeft')) thrust.addScaledVector(right, -1);
-    if (held.has('KeyD') || held.has('ArrowRight')) thrust.addScaledVector(right, 1);
     if (held.has('Space') || held.has('KeyR') || held.has('KeyE')) thrust.addScaledVector(localUp, 1);
     if (held.has('ControlLeft') || held.has('ControlRight') || held.has('KeyF') || held.has('KeyC')) thrust.addScaledVector(localUp, -1);
     if (thrust.lengthSq() === 0) return;
@@ -1554,7 +1577,7 @@ function FlyMovement({ active, speed }: { active: boolean; speed: number }) {
     // Movement is exactly the throttle setting for as long as a key is held and
     // nothing at all on the frame it is released — no momentum carrying the
     // camera past what it was aimed at, no bank into a turn, no lens flex under
-    // speed. Sideways is sideways.
+    // speed.
     camera.position.addScaledVector(thrust.normalize(), cruiseSpeed * delta);
   });
 
@@ -1636,20 +1659,31 @@ function CameraDirector({
  */
 const zoomStepFraction = 0.2;
 
-function AltitudeScaledZoom() {
+type OrbitControlsHandle = React.ComponentRef<typeof OrbitControls>;
+
+function AltitudeScaledControls({
+  controlsRef,
+  speedMultiplier,
+}: {
+  controlsRef: React.RefObject<OrbitControlsHandle | null>;
+  speedMultiplier: number;
+}) {
   const camera = useThree((state) => state.camera);
-  const controls = useThree((state) => state.controls) as
-    | { target?: Vector3; zoomSpeed?: number }
-    | null;
 
   useFrame(() => {
-    if (!controls?.target || typeof controls.zoomSpeed !== 'number') return;
+    const controls = controlsRef.current;
+    if (!controls) return;
     const range = camera.position.distanceTo(controls.target);
     if (!(range > 1e-9)) return;
-    const altitude = Math.max(camera.position.length() - earthRadius, minimumCameraAltitude);
+    const groundRadius = terrainSurfaceRadiusAt(camera.position, mapSurfaceRadius);
+    const altitude = Math.max(camera.position.length() - groundRadius, minimumCameraAltitude);
+    const proximitySpeed = proximitySpeedFor(Math.min(altitude, range));
+    const movementSpeed = speedMultiplier * proximitySpeed;
+    controls.rotateSpeed = baseOrbitRotateSpeed * movementSpeed;
+    controls.panSpeed = baseOrbitPanSpeed * movementSpeed;
     // Solve 0.95 ** zoomSpeed === the step we want, so one notch closes
     // `zoomStepFraction` of whichever is smaller, the altitude or the orbit.
-    const step = 1 - zoomStepFraction * (Math.min(altitude, range) / range);
+    const step = 1 - zoomStepFraction * speedMultiplier * (Math.min(altitude, range) / range);
     controls.zoomSpeed = Math.log(step) / Math.log(0.95);
   });
 
@@ -1661,14 +1695,16 @@ function EarthSurfaceCollision() {
 
   useFrame(() => {
     const distance = camera.position.length();
-    if (distance >= minimumCameraRadius) return;
+    const terrainRadius = terrainSurfaceRadiusAt(camera.position, mapSurfaceRadius);
+    const minimumRadius = Math.max(minimumCameraRadius, terrainRadius + minimumCameraAltitude);
+    if (distance >= minimumRadius) return;
 
     if (distance < 1e-9) {
-      camera.position.set(minimumCameraRadius, 0, 0);
+      camera.position.set(minimumRadius, 0, 0);
       return;
     }
 
-    camera.position.multiplyScalar(minimumCameraRadius / distance);
+    camera.position.multiplyScalar(minimumRadius / distance);
   });
 
   return null;
@@ -1683,6 +1719,7 @@ function GlobeScene({
   flyMode,
   follow,
   speed,
+  orbitSpeed,
   orbitTarget,
   focusRequest,
   resetRequest,
@@ -1701,6 +1738,7 @@ function GlobeScene({
   flyMode: boolean;
   follow: boolean;
   speed: number;
+  orbitSpeed: number;
   orbitTarget: [number, number, number];
   focusRequest: number;
   resetRequest: number;
@@ -1711,6 +1749,8 @@ function GlobeScene({
   onPosition: (value: [number, number, number]) => void;
   onSelect: (flight: Aircraft) => void;
 }) {
+  const orbitControlsRef = useRef<OrbitControlsHandle>(null);
+
   return (
     <>
       <color attach="background" args={['#02070c']} />
@@ -1728,12 +1768,13 @@ function GlobeScene({
       )}
       <Stars radius={70} depth={38} count={2400} factor={2.1} saturation={0.25} fade speed={0.2} />
       <OrbitControls
+        ref={orbitControlsRef}
         makeDefault={!flyMode}
         enabled={!flyMode && !follow}
         enableDamping
         dampingFactor={0.055}
-        rotateSpeed={0.48}
-        panSpeed={0.65}
+        rotateSpeed={baseOrbitRotateSpeed * orbitSpeed}
+        panSpeed={baseOrbitPanSpeed * orbitSpeed}
         minDistance={minimumCameraAltitude}
         maxDistance={30}
         enablePan
@@ -1747,7 +1788,7 @@ function GlobeScene({
       />
       <FlyMovement active={flyMode} speed={speed} />
       <CameraDirector selected={selected} predictive={predictive} follow={follow} focusRequest={focusRequest} resetRequest={resetRequest} motionScale={motionScale} onPosition={onPosition} />
-      <AltitudeScaledZoom />
+      <AltitudeScaledControls controlsRef={orbitControlsRef} speedMultiplier={orbitSpeed} />
       <EarthSurfaceCollision />
     </>
   );
@@ -1960,12 +2001,15 @@ export function AirTrafficApp() {
   const [refreshKey, setRefreshKey] = useState(0);
   const { aircraft: feedAircraft, state: feedState, error, meta } = useAircraftFeed(refreshKey);
   const [externalAircraft, setExternalAircraft] = useState<Aircraft[]>([]);
-  const [useNetworks, setUseNetworks] = useState(true);
+  const [useNetworks, setUseNetworks] = useState(false);
   const [globalSweep, setGlobalSweep] = useState(false);
   const [cameraPosition, setCameraPosition] = useState<[number, number, number]>([0, 0.3, 6.7]);
   const { aircraft: networkAircraft, sources: networkSources } = useNetworkAircraft(useNetworks, globalSweep, cameraPosition);
 
   const aircraft = useMemo(() => {
+    // OpenSky is the primary health signal. Optional network/search results must
+    // never leave aircraft on the globe when that primary feed is offline.
+    if (feedState !== 'live' && feedState !== 'stale') return [];
     if (networkAircraft.length === 0 && externalAircraft.length === 0) return feedAircraft;
     // The same airframe can arrive from OpenSky and a community network at once;
     // keep whichever fix is newer so the globe shows the best available position.
@@ -1975,7 +2019,7 @@ export function AirTrafficApp() {
       if (!existing || flight.positionTime > existing.positionTime) merged.set(flight.id, flight);
     }
     return [...merged.values()];
-  }, [feedAircraft, networkAircraft, externalAircraft]);
+  }, [feedAircraft, feedState, networkAircraft, externalAircraft]);
   const [selected, setSelected] = useState<Aircraft | null>(null);
   const [filtersOpen, setFiltersOpen] = useState(true);
   const [helpOpen, setHelpOpen] = useState(false);
@@ -1991,12 +2035,13 @@ export function AirTrafficApp() {
   const [motionSpeed, setMotionSpeed] = useState([1]);
   const [flyMode, setFlyMode] = useState(false);
   const [follow, setFollow] = useState(false);
-  const [flyThrottle, setFlyThrottle] = useState([0.53]);
+  const [flyThrottle, setFlyThrottle] = useState([0]);
   const [focusRequest, setFocusRequest] = useState(0);
   const [resetRequest, setResetRequest] = useState(0);
   const [orbitTarget, setOrbitTarget] = useState<[number, number, number]>([0, 0, 0]);
   const [utc, setUtc] = useState('00:00:00');
   const searchRef = useRef<HTMLInputElement>(null);
+  const selectedPanelRef = useRef<HTMLElement>(null);
   const { lists: favoriteLists, setLists: setFavoriteLists } = useFavoriteLists();
   const [activeListIds, setActiveListIds] = useState<string[]>([]);
   const [newListName, setNewListName] = useState('');
@@ -2011,11 +2056,25 @@ export function AirTrafficApp() {
   }, []);
 
   useEffect(() => {
+    if (!selected) return;
+
+    const dismissSelected = (event: PointerEvent) => {
+      const target = event.target;
+      if (target instanceof Node && selectedPanelRef.current?.contains(target)) return;
+      setSelected(null);
+      setFollow(false);
+    };
+
+    document.addEventListener('pointerdown', dismissSelected);
+    return () => document.removeEventListener('pointerdown', dismissSelected);
+  }, [selected]);
+
+  useEffect(() => {
     setSelected((current) => {
-      if (!current) return null;
+      if (!current || (feedState !== 'live' && feedState !== 'stale')) return null;
       return aircraft.find((flight) => flight.id === current.id) ?? current;
     });
-  }, [aircraft]);
+  }, [aircraft, feedState]);
 
   useEffect(() => {
     const shortcut = (event: KeyboardEvent) => {
@@ -2029,6 +2088,7 @@ export function AirTrafficApp() {
   }, []);
 
   const flySpeed = flySpeedFor(flyThrottle[0]);
+  const orbitSpeed = orbitSpeedFor(flyThrottle[0]);
   const countries = useMemo(() => [...new Set(aircraft.map((flight) => flight.country))].sort((a, b) => a.localeCompare(b)), [aircraft]);
 
   const filteredAircraft = useMemo(() => {
@@ -2171,6 +2231,7 @@ export function AirTrafficApp() {
             flyMode={flyMode}
             follow={follow}
             speed={flySpeed}
+            orbitSpeed={orbitSpeed}
             orbitTarget={orbitTarget}
             focusRequest={focusRequest}
             resetRequest={resetRequest}
@@ -2191,7 +2252,7 @@ export function AirTrafficApp() {
         <div className="flex min-w-0 items-center gap-3">
           <div className="grid size-9 place-items-center border border-cyan-300/35 bg-cyan-300/[0.08] text-cyan-200"><Globe2 className="size-[18px]" /></div>
           <div>
-            <div className="flex items-center gap-2"><h1 className="font-semibold tracking-[0.16em] text-white">SKYTRACE</h1><span className={`rounded-sm border px-1.5 py-0.5 font-mono text-[8px] tracking-[0.18em] ${feedState === 'live' ? 'border-lime-200/20 bg-lime-200/[0.08] text-lime-200' : 'border-amber-200/20 bg-amber-200/[0.08] text-amber-200'}`}>{feedState === 'live' ? 'LIVE' : feedState === 'connecting' ? 'LINKING' : 'PREVIEW'}</span></div>
+            <div className="flex items-center gap-2"><h1 className="font-semibold tracking-[0.16em] text-white">SKYTRACE</h1><span className={`rounded-sm border px-1.5 py-0.5 font-mono text-[8px] tracking-[0.18em] ${feedState === 'live' ? 'border-lime-200/20 bg-lime-200/[0.08] text-lime-200' : 'border-amber-200/20 bg-amber-200/[0.08] text-amber-200'}`}>{feedState === 'live' ? 'LIVE' : feedState === 'connecting' ? 'LINKING' : feedState === 'stale' ? 'DELAYED' : 'OFFLINE'}</span></div>
             <p className="hidden font-mono text-[9px] tracking-[0.14em] text-slate-500 sm:block">GLOBAL AIRSPACE / 3D OPERATIONS</p>
           </div>
         </div>
@@ -2269,28 +2330,28 @@ export function AirTrafficApp() {
             <span className="relative flex size-2"><span className={`absolute inline-flex size-full animate-ping rounded-full opacity-50 ${feedState === 'live' ? 'bg-lime-300' : 'bg-amber-300'}`} /><span className={`relative inline-flex size-2 rounded-full ${feedState === 'live' ? 'bg-lime-300' : 'bg-amber-300'}`} /></span>
             <span className="font-mono text-[10px] tracking-wider text-slate-400">{formatNumber(filteredAircraft.length)} / {formatNumber(aircraft.length)} TRACKS</span>
           </div>
-          <Button onClick={() => setHelpOpen((value) => !value)} variant="ghost" size="icon" className="rounded-none text-slate-400 hover:bg-white/[0.06] hover:text-white" aria-label="Controls help"><CircleHelp /></Button>
+          <Button onClick={() => setHelpOpen((value) => !value)} variant="ghost" size="icon" className="rounded-none text-slate-400 hover:bg-white/[0.06] hover:text-white" aria-label="Controls help" aria-controls="free-flight-controls" aria-expanded={helpOpen}><CircleHelp /></Button>
           <Button onClick={() => setRefreshKey((value) => value + 1)} variant="ghost" size="icon" className="rounded-none text-slate-400 hover:bg-white/[0.06] hover:text-white" aria-label="Refresh live data"><RefreshCw className={feedState === 'connecting' ? 'animate-spin' : ''} /></Button>
-          <Button variant="ghost" size="icon" className="hidden rounded-none text-slate-400 hover:bg-white/[0.06] hover:text-white sm:inline-flex" aria-label="Settings"><Settings2 /></Button>
+          <Button onClick={() => setHelpOpen((value) => !value)} variant="ghost" size="icon" className="hidden rounded-none text-slate-400 hover:bg-white/[0.06] hover:text-white sm:inline-flex" aria-label="Free-flight settings" aria-controls="free-flight-controls" aria-expanded={helpOpen}><Settings2 /></Button>
         </div>
       </header>
 
       {helpOpen && (
-        <div className="pointer-events-auto absolute right-4 top-[78px] z-30 w-[300px] border border-cyan-300/20 bg-[#061018]/95 p-4 shadow-2xl backdrop-blur-xl sm:right-6">
+        <div id="free-flight-controls" className="pointer-events-auto absolute right-4 top-[78px] z-30 w-[300px] border border-cyan-300/20 bg-[#061018]/95 p-4 shadow-2xl backdrop-blur-xl sm:right-6">
           <div className="flex items-center"><Navigation className="mr-2 size-4 text-cyan-300" /><h2 className="text-[11px] font-semibold tracking-[0.15em]">FREE-FLIGHT CONTROLS</h2><button onClick={() => setHelpOpen(false)} className="ml-auto text-slate-500 hover:text-white"><X className="size-4" /></button></div>
           <p className="mt-3 text-xs leading-5 text-slate-400">Select <span className="text-cyan-200">FLY</span>, then use the mouse to look anywhere. Press Esc to release the mouse.</p>
           <div className="mt-4 grid grid-cols-[1fr_auto] gap-y-3 text-[11px] text-slate-400">
             <span>Forward / back</span><span className="flex gap-1"><Key>Z/W</Key><Key>S</Key><Key>↑↓</Key></span>
-            <span>Left / right</span><span className="flex gap-1"><Key>Q/A</Key><Key>D</Key><Key>←→</Key></span>
+            <span>Turn left / right</span><span className="flex gap-1"><Key>Q/A</Key><Key>D</Key><Key>←→</Key></span>
             <span>Rise / descend</span><span className="flex gap-1"><Key>SPACE</Key><Key>CTRL</Key></span>
             <span>Move faster</span><span className="flex gap-1"><Key>SHIFT</Key></span>
           </div>
-          <div className="mt-4 border-t border-white/[0.08] pt-3"><div className="mb-2 flex justify-between"><span className="telemetry-label">Flight speed</span><span className="font-mono text-[9px] text-cyan-200">{flySpeed.toFixed(2)} u/s</span></div><Slider min={0} max={1} step={0.01} value={flyThrottle} onValueChange={(value) => setFlyThrottle(toSliderTuple(value))} /><div className="mt-1.5 flex justify-between font-mono text-[8px] tracking-wider text-slate-600"><span>CRAWL</span><span>SHIFT FOR ×3</span><span>DASH</span></div></div>
+          <div className="mt-4 border-t border-white/[0.08] pt-3"><div className="mb-2 flex justify-between"><span className="telemetry-label">Camera speed</span><span className="font-mono text-[9px] text-cyan-200">{formatCameraSpeed(flySpeed)} u/s</span></div><Slider min={0} max={1} step={0.01} value={flyThrottle} onValueChange={(value) => setFlyThrottle(toSliderTuple(value))} /><div className="mt-1.5 flex justify-between font-mono text-[8px] tracking-wider text-slate-600"><span>PRECISION</span><span>SHIFT FOR ×3</span><span>DASH</span></div><p className="mt-2 text-[9px] leading-4 text-slate-600">Applies to orbit and free flight. Movement automatically becomes finer as you approach the ground.</p></div>
         </div>
       )}
 
-      {feedState === 'preview' && error && (
-        <div className="pointer-events-none absolute left-1/2 top-[78px] z-20 flex max-w-[calc(100%-32px)] -translate-x-1/2 items-center gap-2 border border-amber-300/20 bg-amber-300/[0.08] px-3 py-2 font-mono text-[9px] tracking-wider text-amber-100 backdrop-blur-xl"><AlertTriangle className="size-3.5 shrink-0" /><span className="truncate">PREVIEW DATA — {error}</span></div>
+      {(feedState === 'error' || feedState === 'stale') && error && (
+        <div className="pointer-events-none absolute left-1/2 top-[78px] z-20 flex max-w-[calc(100%-32px)] -translate-x-1/2 items-center gap-2 border border-amber-300/20 bg-amber-300/[0.08] px-3 py-2 font-mono text-[9px] tracking-wider text-amber-100 backdrop-blur-xl"><AlertTriangle className="size-3.5 shrink-0" /><span className="truncate">{feedState === 'stale' ? 'LIVE REFRESH DELAYED' : 'LIVE DATA UNAVAILABLE'} — {error}</span></div>
       )}
 
       <aside className={`pointer-events-auto absolute bottom-14 left-3 top-[78px] z-10 flex w-[292px] flex-col border border-white/[0.09] bg-[#061018]/84 shadow-2xl shadow-black/40 backdrop-blur-xl transition-transform duration-300 sm:left-6 ${filtersOpen ? 'translate-x-0' : '-translate-x-[calc(100%+32px)]'}`}>
@@ -2423,7 +2484,7 @@ export function AirTrafficApp() {
       {!filtersOpen && <Button onClick={() => setFiltersOpen(true)} variant="outline" size="icon" className="pointer-events-auto absolute left-3 top-[78px] z-10 rounded-none border-white/10 bg-[#061018]/80 text-cyan-200 backdrop-blur-xl hover:bg-white/10 sm:left-6" aria-label="Open filters"><Filter /></Button>}
 
       {selected && (
-        <aside className="pointer-events-auto absolute bottom-12 left-2 right-2 z-20 flex max-h-[48vh] flex-col border border-white/[0.09] bg-[#061018]/94 shadow-2xl shadow-black/50 backdrop-blur-xl lg:bottom-14 lg:left-auto lg:right-6 lg:top-[78px] lg:max-h-none lg:w-[312px]">
+        <aside ref={selectedPanelRef} className="pointer-events-auto absolute bottom-12 left-2 right-2 z-20 flex max-h-[48vh] flex-col border border-white/[0.09] bg-[#061018]/94 shadow-2xl shadow-black/50 backdrop-blur-xl lg:bottom-14 lg:left-auto lg:right-6 lg:top-[78px] lg:max-h-none lg:w-[312px]">
           <div className="border-b border-white/[0.08] p-4">
             <div className="flex items-start gap-3"><div className="grid size-10 place-items-center border border-lime-200/30 bg-lime-200/[0.08] text-lime-200"><Plane className="size-5 rotate-45" /></div><div className="min-w-0"><p className="font-mono text-[9px] tracking-[0.16em] text-lime-200">{selected.onGround ? 'ON GROUND' : 'AIRBORNE'} • TRACKED</p><h2 className="mt-0.5 font-mono text-xl font-semibold tracking-wide text-white">{selected.callsign}</h2></div><button onClick={() => { setSelected(null); setFollow(false); }} className="ml-auto text-slate-500 transition hover:text-white" aria-label="Close aircraft details"><X className="size-4" /></button></div>
           </div>
@@ -2498,17 +2559,28 @@ export function AirTrafficApp() {
 
       <div className="pointer-events-none absolute bottom-[56px] right-3 hidden border border-white/[0.08] bg-[#061018]/72 px-3 py-2 font-mono text-[8px] tracking-wider text-slate-600 backdrop-blur-xl xl:block"><span className="mr-3 text-slate-500">CAMERA XYZ</span>{cameraPosition.map((axis, index) => <span key={index} className="ml-2"><span className="text-cyan-300/60">{['X', 'Y', 'Z'][index]}</span> {axis.toFixed(2)}</span>)}</div>
 
-      <a
-        href="https://www.arcgis.com/home/item.html?id=10df2279f9684e4a9f6a7f08febac2a9"
-        target="_blank"
-        rel="noreferrer"
-        className="pointer-events-auto absolute bottom-[46px] right-2 z-30 border border-white/[0.08] bg-[#061018]/82 px-2 py-1 font-mono text-[8px] tracking-wide text-slate-400 backdrop-blur-md transition hover:text-cyan-200 sm:right-3"
-      >
-        Imagery © Esri, Vantor, Earthstar Geographics, GIS User Community
-      </a>
+      <div className="pointer-events-auto absolute bottom-[46px] right-2 z-30 border border-white/[0.08] bg-[#061018]/82 px-2 py-1 font-mono text-[8px] tracking-wide text-slate-400 backdrop-blur-md sm:right-3">
+        <a
+          href="https://www.arcgis.com/home/item.html?id=10df2279f9684e4a9f6a7f08febac2a9"
+          target="_blank"
+          rel="noreferrer"
+          className="transition hover:text-cyan-200"
+        >
+          Imagery © Esri, Vantor, Earthstar Geographics, GIS User Community
+        </a>
+        <span className="mx-1.5 text-slate-600">·</span>
+        <a
+          href="https://github.com/tilezen/joerd/blob/master/docs/attribution.md"
+          target="_blank"
+          rel="noreferrer"
+          className="transition hover:text-cyan-200"
+        >
+          Terrain © Mapzen + providers
+        </a>
+      </div>
 
       <footer className="pointer-events-none absolute inset-x-0 bottom-0 z-30 flex h-10 items-center border-t border-white/[0.08] bg-[#030a10]/82 px-4 font-mono text-[9px] tracking-wider text-slate-600 backdrop-blur-xl sm:px-6">
-        <span className="flex items-center gap-2"><Radio className={`size-3 ${feedState === 'live' ? 'text-cyan-300' : 'text-amber-300'}`} /> {feedState === 'live' ? 'OPENSKY LIVE NETWORK' : 'OPENSKY CONNECTION PENDING'}</span><span className="mx-4 hidden h-3 w-px bg-white/10 sm:block" /><span className="hidden sm:inline">UTC {utc}</span><span className="ml-4 hidden text-slate-700 xl:inline">EARTH / SATELLITE IMAGERY</span>
+        <span className="flex items-center gap-2"><Radio className={`size-3 ${feedState === 'live' ? 'text-cyan-300' : 'text-amber-300'}`} /> {feedState === 'live' ? 'OPENSKY LIVE NETWORK' : feedState === 'connecting' ? 'OPENSKY CONNECTION PENDING' : feedState === 'stale' ? 'OPENSKY REFRESH DELAYED' : 'OPENSKY OFFLINE'}</span><span className="mx-4 hidden h-3 w-px bg-white/10 sm:block" /><span className="hidden sm:inline">UTC {utc}</span><span className="ml-4 hidden text-slate-700 xl:inline">EARTH / 3D TERRAIN + SATELLITE</span>
         <div className="ml-auto flex items-center gap-4"><span className="hidden items-center gap-1.5 md:flex"><Activity className="size-3 text-lime-300" /> {motionSpeed[0] === 1 ? 'TRUE-SPEED LIVE MOTION' : `${motionSpeed[0]}× TIME-LAPSE MOTION`}</span><span className="hidden items-center gap-1.5 xl:flex">{meta ? `${meta.refreshAfter}s SOURCE SYNC` : 'CONNECTING'}</span><span className="hidden items-center gap-1.5 lg:flex"><ArrowUpFromLine className="size-3" /> SPACE</span><span className="hidden items-center gap-1.5 lg:flex"><ArrowDownToLine className="size-3" /> CTRL</span><span className="flex items-center gap-1.5"><Gauge className="size-3" /> 60 FPS</span></div>
       </footer>
     </main>

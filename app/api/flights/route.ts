@@ -27,6 +27,8 @@ type FlightCache = { body: FlightResponse; expiresAt: number } | null;
 type FlightResponse = {
   source: 'opensky';
   mode: 'anonymous' | 'authenticated';
+  stale?: boolean;
+  warning?: string;
   sourceTimestamp: number;
   receivedAt: number;
   refreshAfter: number;
@@ -56,12 +58,21 @@ type FlightResponse = {
 let tokenCache: TokenCache = null;
 let flightCache: FlightCache = null;
 let inflightSnapshot: Promise<FlightResponse> | null = null;
+let nextRefreshAttemptAt = 0;
 
-async function getToken() {
-  const clientId = process.env.OPENSKY_CLIENT_ID;
-  const clientSecret = process.env.OPENSKY_CLIENT_SECRET;
+const retryDelayMs = 60_000;
 
-  if (!clientId || !clientSecret) return null;
+function isVercelRuntime() {
+  return process.env.VERCEL === '1' || Boolean(process.env.VERCEL_ENV);
+}
+
+async function getToken(): Promise<string> {
+  const clientId = process.env.OPENSKY_CLIENT_ID?.trim();
+  const clientSecret = process.env.OPENSKY_CLIENT_SECRET?.trim();
+
+  if (!clientId || !clientSecret) {
+    throw new Error('OpenSky API credentials are required outside Vercel');
+  }
   if (tokenCache && tokenCache.expiresAt > Date.now() + 60_000) return tokenCache.token;
 
   const body = new URLSearchParams({
@@ -70,32 +81,50 @@ async function getToken() {
     client_secret: clientSecret,
   });
 
-  const response = await fetch(
-    'https://auth.opensky-network.org/auth/realms/opensky-network/protocol/openid-connect/token',
-    {
-      method: 'POST',
-      headers: { 'content-type': 'application/x-www-form-urlencoded' },
-      body,
-      signal: AbortSignal.timeout(15_000),
-    },
-  );
+  try {
+    const response = await fetch(
+      'https://auth.opensky-network.org/auth/realms/opensky-network/protocol/openid-connect/token',
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/x-www-form-urlencoded' },
+        body,
+        signal: AbortSignal.timeout(15_000),
+      },
+    );
 
-  if (!response.ok) throw new Error(`OpenSky authentication failed (${response.status})`);
-  const data = (await response.json()) as { access_token: string; expires_in?: number };
-  tokenCache = {
-    token: data.access_token,
-    expiresAt: Date.now() + Math.max(120, data.expires_in ?? 1800) * 1000,
-  };
-  return tokenCache.token;
+    if (!response.ok) {
+      throw new Error(`OpenSky rejected the API credentials (${response.status})`);
+    }
+    const data = (await response.json()) as { access_token?: string; expires_in?: number };
+    if (!data.access_token) throw new Error('OpenSky returned no OAuth access token');
+
+    tokenCache = {
+      token: data.access_token,
+      expiresAt: Date.now() + Math.max(120, data.expires_in ?? 1800) * 1000,
+    };
+    return tokenCache.token;
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith('OpenSky ')) throw error;
+    throw new Error('OpenSky authentication is unavailable');
+  }
 }
 
 async function fetchSnapshot(): Promise<FlightResponse> {
-  const token = await getToken();
-  const response = await fetch('https://opensky-network.org/api/states/all?extended=1', {
-    headers: token ? { authorization: `Bearer ${token}` } : undefined,
-    cache: 'no-store',
-    signal: AbortSignal.timeout(22_000),
-  });
+  // Vercel's shared cloud egress is unreliable with OpenSky authentication.
+  // Local development uses the account allowance; Vercel deliberately uses the
+  // anonymous IP allowance and never attempts to transmit the API credentials.
+  const token = isVercelRuntime() ? null : await getToken();
+  const authenticated = Boolean(token);
+  const requestStates = (accessToken: string | null) => fetch(
+    'https://opensky-network.org/api/states/all?extended=1',
+    {
+      headers: accessToken ? { authorization: `Bearer ${accessToken}` } : undefined,
+      cache: 'no-store',
+      signal: AbortSignal.timeout(22_000),
+    },
+  );
+
+  const response = await requestStates(token);
 
   if (!response.ok) {
     const retryAfter = response.headers.get('x-rate-limit-retry-after-seconds');
@@ -131,9 +160,8 @@ async function fetchSnapshot(): Promise<FlightResponse> {
     ]];
   });
 
-  const authenticated = Boolean(token);
-  // A global snapshot costs four credits. Ninety seconds stays below the
-  // free authenticated daily allowance while anonymous mode needs 15 minutes.
+  // A global snapshot costs four credits. Ninety seconds stays below the free
+  // authenticated allowance; anonymous access is paced to its smaller bucket.
   const refreshAfter = authenticated ? 90 : 900;
   const expiresAt = Date.now() + refreshAfter * 1000;
   const body: FlightResponse = {
@@ -150,7 +178,23 @@ async function fetchSnapshot(): Promise<FlightResponse> {
   };
 
   flightCache = { body, expiresAt };
+  nextRefreshAttemptAt = 0;
   return body;
+}
+
+function refreshSnapshot() {
+  inflightSnapshot ??= fetchSnapshot().finally(() => { inflightSnapshot = null; });
+  return inflightSnapshot;
+}
+
+function unavailableMessage(error: unknown) {
+  if (error instanceof DOMException && (error.name === 'TimeoutError' || error.name === 'AbortError')) {
+    return 'OpenSky is taking longer than expected; retrying automatically';
+  }
+  if (error instanceof Error && /aborted|timeout/i.test(error.message)) {
+    return 'OpenSky is taking longer than expected; retrying automatically';
+  }
+  return error instanceof Error ? error.message : 'The live aircraft feed is temporarily unavailable';
 }
 
 export async function GET() {
@@ -163,12 +207,42 @@ export async function GET() {
     });
   }
 
+  // Never throw away a valid global snapshot merely because the next OpenSky
+  // refresh is slow. Return the last positions immediately and revalidate once
+  // in the background; aircraft prediction continues moving them from their
+  // source timestamps while this request recovers.
+  if (flightCache) {
+    if (Date.now() >= nextRefreshAttemptAt) {
+      nextRefreshAttemptAt = Date.now() + retryDelayMs;
+      void refreshSnapshot().catch(() => {
+        // The stale snapshot remains usable. A later request retries after the
+        // backoff instead of making every browser wait on the same timeout.
+      });
+    }
+
+    return NextResponse.json(
+      {
+        ...flightCache.body,
+        stale: true,
+        warning: 'OpenSky refresh delayed; showing the latest received positions',
+        refreshAfter: retryDelayMs / 1000,
+        nextRefreshAt: Math.ceil((Date.now() + retryDelayMs) / 1000),
+      },
+      {
+        headers: {
+          'cache-control': 'private, no-store',
+          'x-skytrace-cache': 'stale',
+          warning: '110 - "Response is stale"',
+        },
+      },
+    );
+  }
+
   try {
     // Collapse concurrent misses into one upstream snapshot. Anonymous access
     // allows only ~100 global requests a day, so several clients refreshing at
     // the same moment must not each spend one.
-    inflightSnapshot ??= fetchSnapshot().finally(() => { inflightSnapshot = null; });
-    const body = await inflightSnapshot;
+    const body = await refreshSnapshot();
 
     return NextResponse.json(body, {
       headers: {
@@ -181,9 +255,9 @@ export async function GET() {
   } catch (error) {
     return NextResponse.json(
       {
-        error: error instanceof Error ? error.message : 'The live aircraft feed is temporarily unavailable',
+        error: unavailableMessage(error),
       },
-      { status: 503 },
+      { status: 503, headers: { 'retry-after': String(retryDelayMs / 1000) } },
     );
   }
 }

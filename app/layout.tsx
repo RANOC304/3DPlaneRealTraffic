@@ -2,7 +2,22 @@ import type { Metadata } from 'next';
 import { Geist, Geist_Mono } from 'next/font/google';
 import './globals.css';
 
-const siteUrl = process.env.NEXT_PUBLIC_SITE_URL ?? 'http://localhost:3000';
+function parseSiteUrl(value?: string) {
+  const candidate = value?.trim();
+  if (!candidate) return null;
+
+  try {
+    return new URL(/^https?:\/\//i.test(candidate) ? candidate : `https://${candidate}`);
+  } catch {
+    return null;
+  }
+}
+
+const metadataBase =
+  parseSiteUrl(process.env.NEXT_PUBLIC_SITE_URL) ??
+  parseSiteUrl(process.env.VERCEL_PROJECT_PRODUCTION_URL) ??
+  parseSiteUrl(process.env.VERCEL_URL) ??
+  new URL('http://localhost:3000');
 
 const geistSans = Geist({
   variable: '--font-geist-sans',
@@ -15,9 +30,10 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  metadataBase: new URL(siteUrl),
+  metadataBase,
   title: 'Skytrace — Live 3D Air Traffic',
   description: 'Explore live global air traffic around a fully interactive 3D Earth.',
+  icons: { icon: '/favicon.svg' },
   openGraph: {
     title: 'Skytrace — Live 3D Air Traffic',
     description: 'Explore real aircraft around a fully interactive 3D Earth with free-flight camera controls.',
