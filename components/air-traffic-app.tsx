@@ -1679,7 +1679,6 @@ function FlyMovement({ active, speed }: { active: boolean; speed: number }) {
   const right = useMemo(() => new Vector3(), []);
   const localUp = useMemo(() => new Vector3(), []);
   const thrust = useMemo(() => new Vector3(), []);
-  const orientation = useRef(new Euler(0, 0, 0, 'YXZ'));
 
   useEffect(() => {
     const down = (event: KeyboardEvent) => keys.current.add(event.code);
@@ -1717,9 +1716,9 @@ function FlyMovement({ active, speed }: { active: boolean; speed: number }) {
     const turn = Number(held.has('KeyQ') || held.has('KeyA') || held.has('ArrowLeft'))
       - Number(held.has('KeyD') || held.has('ArrowRight'));
     if (turn !== 0) {
-      orientation.current.setFromQuaternion(camera.quaternion, 'YXZ');
-      orientation.current.y += turn * flyYawSpeed * delta;
-      camera.quaternion.setFromEuler(orientation.current);
+      // Rotate around the camera's own up axis so left/right always stays a
+      // horizontal turn, even after entering fly mode from an angled globe view.
+      camera.rotateY(turn * flyYawSpeed * delta);
     }
 
     camera.getWorldDirection(forward).normalize();

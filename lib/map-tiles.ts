@@ -566,6 +566,7 @@ export function buildMapTileGeometry(
 }
 
 const frustum = new Frustum();
+const selectionProjection = new Matrix4();
 const viewProjection = new Matrix4();
 const cameraPosition = new Vector3();
 const boundingSphere = new Sphere();
@@ -576,6 +577,7 @@ const westEdge = new Vector3();
 const eastEdge = new Vector3();
 
 type Candidate = { zoom: number; x: number; y: number; slack: number };
+type SelectedTile = { tile: MapTile; distance: number };
 
 // How far the walk may guess ahead of the imagery it already holds. Refining
 // only under a loaded tile is what makes the map sharpen level by level; a
@@ -583,6 +585,80 @@ type Candidate = { zoom: number; x: number; y: number; slack: number };
 // still stopping a dive to street level over open ocean from spending a hundred
 // requests to discover there is nothing down there.
 const speculativeLevels = 2;
+
+// Selection runs less often than rendering and imagery arrives asynchronously.
+// Looking through a slightly wider frustum gives camera motion a ring of ready
+// tiles to move into instead of exposing the edge of the current selection.
+const frustumOverscan = 1.18;
+
+/**
+ * Bring an over-detailed selection back inside its mesh budget without ever
+ * making a hole. The previous implementation simply deleted the farthest
+ * leaves. At a grazing angle that exposed the fallback globe as a hard diagonal
+ * cut through the view. Here every deleted subtree is replaced by its coarser
+ * parent (the level-two parents are already the permanent base layer).
+ */
+function fitSelectionToBudget(
+  drawn: SelectedTile[],
+  visited: Map<string, SelectedTile>,
+  maxTiles: number,
+) {
+  if (drawn.length <= maxTiles) return drawn;
+
+  const selected = new Map(drawn.map((candidate) => [candidate.tile.key, candidate]));
+
+  while (selected.size > maxTiles) {
+    const groups = new Map<string, {
+      parent: SelectedTile;
+      descendants: Set<string>;
+      nearestDistance: number;
+    }>();
+
+    for (const candidate of selected.values()) {
+      if (candidate.tile.zoom <= baseMapZoom) continue;
+      let zoom = candidate.tile.zoom - 1;
+      let x = Math.floor(candidate.tile.x / 2);
+      let y = Math.floor(candidate.tile.y / 2);
+
+      while (zoom >= baseMapZoom) {
+        const key = mapTileKey(zoom, x, y);
+        const parent = visited.get(key);
+        if (parent) {
+          let group = groups.get(key);
+          if (!group) {
+            group = { parent, descendants: new Set(), nearestDistance: Number.POSITIVE_INFINITY };
+            groups.set(key, group);
+          }
+          group.descendants.add(candidate.tile.key);
+          group.nearestDistance = Math.min(group.nearestDistance, candidate.distance);
+        }
+        zoom--;
+        x = Math.floor(x / 2);
+        y = Math.floor(y / 2);
+      }
+    }
+
+    const choices = [...groups.values()].filter((group) => {
+      const parentAlreadyDrawn = selected.has(group.parent.tile.key);
+      return group.descendants.size > (parentAlreadyDrawn ? 0 : 1);
+    });
+    if (choices.length === 0) break;
+
+    // Preserve the closest detail. For equally distant regions, replace the
+    // shallowest possible subtree so the transition remains gradual.
+    choices.sort((first, second) => (
+      second.nearestDistance - first.nearestDistance
+      || second.parent.tile.zoom - first.parent.tile.zoom
+    ));
+    const choice = choices[0];
+    for (const key of choice.descendants) selected.delete(key);
+    if (choice.parent.tile.zoom > baseMapZoom) {
+      selected.set(choice.parent.tile.key, choice.parent);
+    }
+  }
+
+  return [...selected.values()];
+}
 
 /**
  * Bounds the curved patch a tile covers. Its centre is the tile's own centre on
@@ -625,7 +701,10 @@ export function selectMapTiles(options: {
   camera.updateMatrixWorld();
   camera.matrixWorldInverse.copy(camera.matrixWorld).invert();
   camera.getWorldPosition(cameraPosition);
-  viewProjection.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
+  selectionProjection.copy(camera.projectionMatrix);
+  selectionProjection.elements[0] /= frustumOverscan;
+  selectionProjection.elements[5] /= frustumOverscan;
+  viewProjection.multiplyMatrices(selectionProjection, camera.matrixWorldInverse);
   frustum.setFromProjectionMatrix(viewProjection);
 
   const pixelsPerUnit = viewportHeight / (2 * Math.tan((camera.fov * degrees) / 2));
@@ -634,6 +713,7 @@ export function selectMapTiles(options: {
 
   const drawn: Array<{ tile: MapTile; distance: number }> = [];
   const wanted: Array<{ tile: MapTile; distance: number }> = [];
+  const visited = new Map<string, SelectedTile>();
   const stack: Candidate[] = baseMapTiles.map((tile) => ({
     zoom: tile.zoom,
     x: tile.x,
@@ -658,6 +738,7 @@ export function selectMapTiles(options: {
       if (facing < Math.cos(horizonAngle + angularRadius)) continue;
       if (!frustum.intersectsSphere(boundingSphere)) continue;
     }
+    visited.set(tile.key, { tile, distance });
 
     // Ground size, not the bounding radius: the bound is deliberately generous
     // and would push the whole map one level sharper than it needs to be.
@@ -694,10 +775,7 @@ export function selectMapTiles(options: {
     wanted.push({ tile, distance });
   }
 
-  if (drawn.length > maxTiles) {
-    drawn.sort((first, second) => first.distance - second.distance);
-    drawn.length = maxTiles;
-  }
+  const rendered = fitSelectionToBudget(drawn, visited, Math.max(baseMapTiles.length, maxTiles));
 
   // Coarse before fine, near before far: the view fills in from a complete
   // blurry map and sharpens, instead of arriving as scattered sharp patches.
@@ -705,11 +783,11 @@ export function selectMapTiles(options: {
     first.tile.zoom - second.tile.zoom || first.distance - second.distance
   ));
   requestMapTiles(wanted.map((candidate) => candidate.tile));
-  requestTerrainTiles(drawn.map((candidate) => candidate.tile));
+  requestTerrainTiles(rendered.map((candidate) => candidate.tile));
 
   liveKeys.clear();
-  for (const candidate of drawn) liveKeys.add(candidate.tile.key);
+  for (const candidate of rendered) liveKeys.add(candidate.tile.key);
   for (const tile of baseMapTiles) liveKeys.add(tile.key);
 
-  return drawn.map((candidate) => candidate.tile);
+  return rendered.map((candidate) => candidate.tile);
 }
