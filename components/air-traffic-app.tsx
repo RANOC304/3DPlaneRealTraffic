@@ -1,7 +1,7 @@
 'use client';
 
 import { Canvas, useFrame, useThree } from '@react-three/fiber';
-import { Line, OrbitControls, PointerLockControls, Stars, useTexture } from '@react-three/drei';
+import { Line, OrbitControls, Stars, useTexture } from '@react-three/drei';
 import {
   Activity,
   AlertTriangle,
@@ -48,6 +48,7 @@ import {
   DynamicDrawUsage,
   Euler,
   Float32BufferAttribute,
+  type Group,
   InstancedMesh,
   type MeshBasicMaterial,
   MeshStandardMaterial,
@@ -75,10 +76,18 @@ import {
   localDayShift,
 } from '@/lib/airport-time';
 import {
+  clockOffsetSeconds,
+  nowSeconds,
+  preciseNowSeconds,
+  syncFlightClock,
+} from '@/lib/flight-clock';
+import { getDetailScale, getFps, sampleFrameTime } from '@/lib/performance-governor';
+import {
   type MapTile,
   baseMapTiles,
   buildMapTileGeometry,
   configureMapTiles,
+  finestTerrainZoomAtMercator,
   isMapTileReady,
   resolveMapTile,
   resolveTerrainTile,
@@ -95,6 +104,7 @@ import {
   requestStructureTiles,
   resolveStructureTile,
   structureRequestsNear,
+  structureZoom,
   subscribeToStructureTiles,
   worldPointToMercator,
 } from '@/lib/map-structures';
@@ -136,6 +146,7 @@ type FeedResponse = {
   warning?: string;
   sourceTimestamp: number;
   receivedAt: number;
+  serverTime: number;
   refreshAfter: number;
   nextRefreshAt: number;
   count: number;
@@ -341,9 +352,7 @@ function toSliderTuple(value: number | readonly number[]): number[] {
   return Array.isArray(value) ? [...(value as readonly number[])] : [value as number];
 }
 
-const nowSeconds = () => Math.floor(Date.now() / 1000);
-const preciseNowSeconds = () => Date.now() / 1000;
-const formatNumber = (value: number) => Math.round(value).toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+const formatNumber =(value: number) => Math.round(value).toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',');
 
 const categoryLabels: Record<number, string> = {
   0: 'No category',
@@ -380,6 +389,10 @@ const earthKilometers = 6371;
 const upVector = new Vector3(0, 1, 0);
 const degrees = Math.PI / 180;
 const maxReportAgeSeconds = 1800;
+// A report stamped ahead of the present is not a measurement of the future; it
+// is the clock still settling on its first samples, or a feeder a second or two
+// out. Rewinding an aircraft by that amount would be worse than ignoring it.
+const maxClockSkewSeconds = 5;
 // Aircraft are drawn far larger than true scale so they read as aircraft rather
 // than as single pixels from orbit. This is that exaggeration factor.
 const aircraftSizeFactor = 0.1;
@@ -394,6 +407,10 @@ const selectionPixelRadius = 13;
 // over this range would bury every usable slow speed in its first few pixels.
 const minimumFlySpeed = 0.001;
 const maximumFlySpeed = 6;
+// Holding Shift in free flight multiplies by this. It exists to cross the
+// to-scale solar system: at full throttle it works out to ~1,500 units/second,
+// which is Jupiter in about twenty seconds and Neptune in under two minutes.
+const interplanetaryWarp = 250;
 const minimumOrbitSpeedMultiplier = 0.1;
 const minimumProximityMultiplier = 0.001;
 // The opening camera position is the upper sensitivity threshold: mouse-drag
@@ -402,7 +419,6 @@ const minimumProximityMultiplier = 0.001;
 const proximityReferenceAltitude = Math.hypot(0, 0.3, 6.7) - earthRadius;
 const baseOrbitRotateSpeed = 0.48;
 const baseOrbitPanSpeed = 0.65;
-const flyYawSpeed = 1.2;
 
 /** Scene units per second for a 0-1 throttle position. */
 function flySpeedFor(throttle: number) {
@@ -509,7 +525,10 @@ function predictionSeconds(flight: Aircraft, timestamp: number, extraSeconds = 0
   // Bound how stale a *report* may be before we stop trusting it, then apply the
   // time-lapse factor. Clamping after scaling pinned every aircraft to a fixed
   // offset — the whole fleet froze once the cached snapshot aged past the cap.
-  return (Math.max(-900, Math.min(maxReportAgeSeconds, reportAge)) + extraSeconds) * motionScale;
+  // Only the report's own age is bounded here: `extraSeconds` reaches minutes
+  // into the past to draw a trail behind the aircraft, and belongs outside it.
+  const trustedAge = Math.max(-maxClockSkewSeconds, Math.min(maxReportAgeSeconds, reportAge));
+  return (trustedAge + extraSeconds) * motionScale;
 }
 
 function globePosition(
@@ -543,12 +562,18 @@ function useAircraftFeed(refreshKey: number) {
 
     const load = async () => {
       try {
+        const sentAtMs = Date.now();
         const response = await fetch('/api/flights', { cache: 'no-store' });
         const data = (await response.json()) as FeedResponse | { error: string };
         if (!response.ok || !('aircraft' in data)) {
           throw new Error('error' in data ? data.error : 'Live feed unavailable');
         }
         if (cancelled) return;
+        // Before anything is placed on the globe: aircraft carry report times in
+        // the feed's clock, and every predicted position is the difference
+        // between that and now. Correcting `now` first is what keeps a browser
+        // whose own clock has drifted from freezing the entire fleet.
+        syncFlightClock(data.serverTime, sentAtMs);
         setAircraft(data.aircraft.map(decodeAircraft));
         setMeta({ mode: data.mode, sourceTimestamp: data.sourceTimestamp, refreshAfter: data.refreshAfter });
         setState(data.stale ? 'stale' : 'live');
@@ -557,7 +582,7 @@ function useAircraftFeed(refreshKey: number) {
         // new fix reaches the globe within seconds of existing. Polling on a
         // blind interval instead either re-downloads the same snapshot or lets
         // a fresh one sit unused for most of a refresh period.
-        const dueIn = data.nextRefreshAt * 1000 - Date.now() + 2_000;
+        const dueIn = (data.nextRefreshAt - preciseNowSeconds()) * 1000 + 2_000;
         timer = setTimeout(load, Math.min(data.refreshAfter * 1000, Math.max(5_000, dueIn)));
       } catch (loadError) {
         if (cancelled) return;
@@ -703,10 +728,18 @@ function DetailedEarthMap() {
     if (now - lastCheck.current < 150) return;
     lastCheck.current = now;
 
+    // A rapid dive through many zoom levels can ask for a couple hundred new
+    // tile meshes in one pass. Under sustained frame pressure, ask for fewer
+    // and coarser ones — a bigger pixel budget lets each tile stay bigger on
+    // screen before the walk refines it further, and a lower tile cap folds
+    // the deepest, least-visible subtrees back into their parents.
+    const detailScale = getDetailScale();
     const selection = selectMapTiles({
       camera: camera as PerspectiveCamera,
       radius: mapSurfaceRadius,
       viewportHeight: gl.domElement.height,
+      pixelBudget: 340 / Math.max(0.4, detailScale),
+      maxTiles: Math.round(120 + 100 * detailScale),
     });
     const live = new Set(selection.map((tile) => tile.key));
 
@@ -726,6 +759,16 @@ function DetailedEarthMap() {
   });
 
   return <>{tiles.map((tile) => <MapTileMesh key={tile.key} tile={tile} />)}</>;
+}
+
+/**
+ * Feeds real frame time into the shared detail governor every frame. Mounted
+ * once, high in the scene, so its reading reflects the whole frame — geometry
+ * builds and all — not just whatever else happens to run before it.
+ */
+function PerformanceGovernor() {
+  useFrame((_state, delta) => sampleFrameTime(delta));
+  return null;
 }
 
 function Atmosphere() {
@@ -774,6 +817,452 @@ function Earth() {
   );
 }
 
+type PlanetConfig = {
+  name: string;
+  radius: number;
+  orbitRadius: number;
+  orbitSpeed: number;
+  spinSpeed: number;
+  tilt: number;
+  seed: number;
+  surface: 'rocky' | 'clouds' | 'banded';
+  base: string;
+  accents: string[];
+  spot?: string;
+  ring?: { inner: number; outer: number; color: string };
+};
+
+type PlanetData = {
+  name: string;
+  radiusKm: number;
+  orbitAu: number;
+  spinSpeed: number;
+  tilt: number;
+  seed: number;
+  surface: PlanetConfig['surface'];
+  base: string;
+  accents: string[];
+  spot?: string;
+  ringKm?: { inner: number; outer: number; color: string };
+};
+
+// The globe IS Earth, so its radius is the yardstick for the whole system:
+// every other body is exactly as many times bigger or smaller as in reality,
+// which makes the sun 109x the globe and Jupiter 11x it.
+const kmToSceneUnits = earthRadius / 6371;
+// Orbital distances are real too, compressed 10x. That still leaves the sun a
+// full (compressed) astronomical unit away and Neptune well past 100,000
+// units — distances you cross in fly mode, not by scrolling.
+const auToSceneUnits = (149_597_870 * kmToSceneUnits) / 10;
+const sunRadius = 696_340 * kmToSceneUnits;
+// Parked along the existing directional light, so the sun finally sits where
+// the scene's light has always been coming from.
+const sunPosition = new Vector3(5, 2, 4).normalize().multiplyScalar(auToSceneUnits);
+// True orbital periods span 88 days to 165 years; at this scale that reads as
+// "frozen" either way, so orbits share a slow linear drift instead. Axial spin
+// carries the sense of motion up close.
+const baseOrbitLinearSpeed = 2;
+
+const planetData: PlanetData[] = [
+  {
+    name: 'Mercury', radiusKm: 2439.7, orbitAu: 0.387, spinSpeed: 0.02, tilt: 0.01,
+    seed: 11, surface: 'rocky', base: '#9c9184', accents: ['#7d7468', '#b7ac9c', '#89806f'],
+  },
+  {
+    name: 'Venus', radiusKm: 6051.8, orbitAu: 0.723, spinSpeed: 0.012, tilt: 3.1,
+    seed: 22, surface: 'clouds', base: '#e6c68e', accents: ['#f2dba8', '#d6ad72'],
+  },
+  {
+    name: 'Mars', radiusKm: 3389.5, orbitAu: 1.524, spinSpeed: 0.045, tilt: 0.44,
+    seed: 33, surface: 'rocky', base: '#c1552c', accents: ['#8f3d1e', '#e0a375', '#7a3419'],
+  },
+  {
+    name: 'Jupiter', radiusKm: 69_911, orbitAu: 5.203, spinSpeed: 0.105, tilt: 0.05,
+    seed: 44, surface: 'banded', base: '#d3a26b', accents: ['#c68a52', '#e8c9a0', '#b97a45', '#f0dcb8'], spot: '#b85c3e',
+  },
+  {
+    name: 'Saturn', radiusKm: 58_232, orbitAu: 9.537, spinSpeed: 0.095, tilt: 0.47,
+    seed: 55, surface: 'banded', base: '#e4c98a', accents: ['#d9bb76', '#f0dba0', '#cbad79'],
+    ringKm: { inner: 66_900, outer: 136_780, color: '#cbad79' },
+  },
+  {
+    name: 'Uranus', radiusKm: 25_362, orbitAu: 19.191, spinSpeed: 0.06, tilt: 1.71,
+    seed: 66, surface: 'banded', base: '#8fd8d6', accents: ['#a6e3e0', '#7bc9c7'],
+  },
+  {
+    name: 'Neptune', radiusKm: 24_622, orbitAu: 30.069, spinSpeed: 0.058, tilt: 0.49,
+    seed: 77, surface: 'banded', base: '#3f5fce', accents: ['#4d6fe0', '#3552b8'], spot: '#25368f',
+  },
+];
+
+const solarSystemPlanets: PlanetConfig[] = planetData.map((planet) => {
+  const orbitRadius = planet.orbitAu * auToSceneUnits;
+  return {
+    ...planet,
+    radius: planet.radiusKm * kmToSceneUnits,
+    orbitRadius,
+    orbitSpeed: baseOrbitLinearSpeed / orbitRadius,
+    ring: planet.ringKm && {
+      inner: planet.ringKm.inner * kmToSceneUnits,
+      outer: planet.ringKm.outer * kmToSceneUnits,
+      color: planet.ringKm.color,
+    },
+  };
+});
+
+// The one body close enough to watch from the globe: real size, real distance
+// on the same 10x-compressed scale, which lands it just past the traffic.
+const moonConfig: PlanetConfig = {
+  name: 'Moon',
+  radius: 1737.4 * kmToSceneUnits,
+  orbitRadius: (384_400 * kmToSceneUnits) / 10,
+  orbitSpeed: 0.03,
+  spinSpeed: 0.03,
+  tilt: 0.09,
+  seed: 88,
+  surface: 'rocky',
+  base: '#9c9c9c',
+  accents: ['#7d7d7d', '#c2c2c2', '#8a8a8a'],
+};
+
+/** Small deterministic PRNG so each planet's texture is stable across renders but distinct from its neighbours. */
+function seededRandom(seed: number) {
+  let value = seed % 2147483647;
+  if (value <= 0) value += 2147483646;
+  return () => {
+    value = (value * 16807) % 2147483647;
+    return (value - 1) / 2147483646;
+  };
+}
+
+/** Draws at `x`, and again offset by a full texture width if `x` is near an edge, so features tile seamlessly around the sphere. */
+function drawWrapped(width: number, x: number, draw: (x: number) => void) {
+  draw(x);
+  if (x < width * 0.25) draw(x + width);
+  if (x > width * 0.75) draw(x - width);
+}
+
+function paintRockyTexture(ctx: CanvasRenderingContext2D, width: number, height: number, config: PlanetConfig) {
+  const rand = seededRandom(config.seed);
+  // Brush sizes and feature counts scale with the canvas so the surface looks
+  // the same whatever resolution it is drawn at.
+  const scale = width / 256;
+  ctx.fillStyle = config.base;
+  ctx.fillRect(0, 0, width, height);
+  for (let i = 0; i < Math.round(110 * scale * scale); i++) {
+    const x = rand() * width;
+    const y = rand() * height;
+    const r = 2 * scale + rand() * width * 0.05;
+    const color = config.accents[Math.floor(rand() * config.accents.length)];
+    drawWrapped(width, x, (px) => {
+      const gradient = ctx.createRadialGradient(px, y, 0, px, y, r);
+      gradient.addColorStop(0, color);
+      gradient.addColorStop(1, 'transparent');
+      ctx.fillStyle = gradient;
+      ctx.beginPath();
+      ctx.arc(px, y, r, 0, Math.PI * 2);
+      ctx.fill();
+    });
+  }
+  // Polar caps.
+  const capGradient = ctx.createLinearGradient(0, 0, 0, height * 0.16);
+  capGradient.addColorStop(0, 'rgba(255,255,255,0.55)');
+  capGradient.addColorStop(1, 'transparent');
+  ctx.fillStyle = capGradient;
+  ctx.fillRect(0, 0, width, height * 0.16);
+  ctx.save();
+  ctx.translate(0, height);
+  ctx.scale(1, -1);
+  ctx.fillRect(0, 0, width, height * 0.16);
+  ctx.restore();
+}
+
+function paintCloudTexture(ctx: CanvasRenderingContext2D, width: number, height: number, config: PlanetConfig) {
+  const rand = seededRandom(config.seed);
+  const scale = width / 256;
+  ctx.fillStyle = config.base;
+  ctx.fillRect(0, 0, width, height);
+  ctx.globalAlpha = 0.35;
+  for (let i = 0; i < Math.round(30 * scale); i++) {
+    const y = rand() * height;
+    const amp = (3 + rand() * 6) * scale;
+    ctx.strokeStyle = config.accents[Math.floor(rand() * config.accents.length)];
+    ctx.lineWidth = (3 + rand() * 6) * scale;
+    ctx.beginPath();
+    for (let x = 0; x <= width; x += 8 * scale) {
+      const yy = y + Math.sin((x / scale) * 0.03 + i) * amp;
+      if (x === 0) ctx.moveTo(x, yy); else ctx.lineTo(x, yy);
+    }
+    ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+}
+
+function paintBandedTexture(ctx: CanvasRenderingContext2D, width: number, height: number, config: PlanetConfig) {
+  const rand = seededRandom(config.seed);
+  const scale = width / 256;
+  const rows = Math.round(30 * scale);
+  for (let i = 0; i < rows; i++) {
+    const y = (i / rows) * height;
+    ctx.fillStyle = config.accents[Math.floor(rand() * config.accents.length)];
+    ctx.fillRect(0, y, width, height / rows + 1);
+  }
+  ctx.globalAlpha = 0.3;
+  for (let i = 0; i < Math.round(46 * scale * scale); i++) {
+    const y = rand() * height;
+    ctx.strokeStyle = config.accents[Math.floor(rand() * config.accents.length)];
+    ctx.lineWidth = (1 + rand() * 2) * scale;
+    ctx.beginPath();
+    for (let x = 0; x <= width; x += 12 * scale) {
+      const yy = y + Math.sin((x / scale) * 0.06 + i * 1.7) * 2.5 * scale;
+      if (x === 0) ctx.moveTo(x, yy); else ctx.lineTo(x, yy);
+    }
+    ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+  if (config.spot) {
+    const x = width * 0.28;
+    const y = height * 0.62;
+    const spot = config.spot;
+    drawWrapped(width, x, (px) => {
+      ctx.fillStyle = spot;
+      ctx.beginPath();
+      ctx.ellipse(px, y, width * 0.09, height * 0.07, 0, 0, Math.PI * 2);
+      ctx.fill();
+    });
+  }
+}
+
+function createPlanetTexture(config: PlanetConfig) {
+  // At true scale a gas giant is tens of units across and gets inspected from
+  // close up, so it earns a bigger canvas than a rocky body a fraction its size.
+  const width = config.radius >= 5 ? 1024 : 512;
+  const height = width / 2;
+  const canvas = document.createElement('canvas');
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext('2d')!;
+  if (config.surface === 'rocky') paintRockyTexture(ctx, width, height, config);
+  else if (config.surface === 'clouds') paintCloudTexture(ctx, width, height, config);
+  else paintBandedTexture(ctx, width, height, config);
+  const texture = new CanvasTexture(canvas);
+  texture.colorSpace = SRGBColorSpace;
+  return texture;
+}
+
+function createSunTexture() {
+  const width = 1280;
+  const height = 640;
+  const scale = width / 320;
+  const canvas = document.createElement('canvas');
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext('2d')!;
+  const rand = seededRandom(3);
+  ctx.fillStyle = '#fff3c4';
+  ctx.fillRect(0, 0, width, height);
+  const colors = ['#ffe07a', '#ffb347', '#fff9e0', '#ffcf6b'];
+  ctx.globalAlpha = 0.55;
+  for (let i = 0; i < Math.round(850 * scale * scale); i++) {
+    const x = rand() * width;
+    const y = rand() * height;
+    const r = (1.5 + rand() * 4) * scale;
+    ctx.fillStyle = colors[Math.floor(rand() * colors.length)];
+    drawWrapped(width, x, (px) => {
+      ctx.beginPath();
+      ctx.arc(px, y, r, 0, Math.PI * 2);
+      ctx.fill();
+    });
+  }
+  ctx.globalAlpha = 1;
+  const texture = new CanvasTexture(canvas);
+  texture.colorSpace = SRGBColorSpace;
+  return texture;
+}
+
+function Sun() {
+  const { camera } = useThree();
+  const innerGlow = useRef<MeshBasicMaterial>(null);
+  const outerGlow = useRef<MeshBasicMaterial>(null);
+  const texture = useMemo(() => createSunTexture(), []);
+  useEffect(() => () => texture.dispose(), [texture]);
+
+  useFrame(({ clock }) => {
+    // At the sun's real size, its glow shells are tens of units across —
+    // large enough to fill the screen and wash it orange from a moderate
+    // distance. Fading them out on approach (mirroring Atmosphere's fade
+    // near the globe) keeps the corona readable as a halo instead of a
+    // full-screen tint once the camera is anywhere near the sun itself.
+    const distance = camera.position.distanceTo(sunPosition);
+    const visibility = Math.max(0, Math.min(1, (distance - sunRadius * 1.4) / (sunRadius * 3)));
+    const pulse = Math.sin(clock.elapsedTime * 0.6) * 0.03;
+    if (innerGlow.current) innerGlow.current.opacity = (0.22 + pulse) * visibility;
+    if (outerGlow.current) outerGlow.current.opacity = (0.09 - pulse * 0.5) * visibility;
+  });
+
+  return (
+    <group>
+      <pointLight color="#ffe4a3" intensity={6} distance={sunRadius * 14} decay={2} />
+      <mesh>
+        <sphereGeometry args={[sunRadius, 96, 96]} />
+        <meshBasicMaterial map={texture} toneMapped={false} />
+      </mesh>
+      <mesh>
+        <sphereGeometry args={[sunRadius * 1.16, 40, 40]} />
+        <meshBasicMaterial ref={innerGlow} color="#ffcf6b" transparent opacity={0.22} side={BackSide} depthWrite={false} toneMapped={false} />
+      </mesh>
+      <mesh>
+        <sphereGeometry args={[sunRadius * 1.43, 40, 40]} />
+        <meshBasicMaterial ref={outerGlow} color="#ff9d3f" transparent opacity={0.09} side={BackSide} depthWrite={false} toneMapped={false} />
+      </mesh>
+    </group>
+  );
+}
+
+/** Three concentric bands with gaps stand in for the real rings' A/B/C divisions, without relying on a radially-mapped ring texture. */
+function SaturnRing({ config }: { config: NonNullable<PlanetConfig['ring']> }) {
+  const span = config.outer - config.inner;
+  const bands = [
+    { inner: config.inner, outer: config.inner + span * 0.34, opacity: 0.85 },
+    { inner: config.inner + span * 0.4, outer: config.inner + span * 0.64, opacity: 0.5 },
+    { inner: config.inner + span * 0.72, outer: config.outer, opacity: 0.78 },
+  ];
+  return (
+    <group rotation={[Math.PI / 2, 0, 0]}>
+      {bands.map((band) => (
+        <mesh key={band.inner}>
+          <ringGeometry args={[band.inner, band.outer, 64]} />
+          <meshBasicMaterial color={config.color} transparent opacity={band.opacity} side={DoubleSide} toneMapped={false} />
+        </mesh>
+      ))}
+    </group>
+  );
+}
+
+/**
+ * Screen radius, in pixels, that a planet is never allowed to shrink below.
+ * At honest scale Jupiter is a pixel and Mercury a hundredth of one from any
+ * distance you can actually fly to, so a to-scale solar system renders as an
+ * empty void. Every space sim solves this the same way: hold distant bodies at
+ * a floor size so they read as points of light, and blend back to true scale
+ * as you close in — which is what the `Math.max(1, …)` below does.
+ */
+const minimumPlanetPixels = 7;
+
+/**
+ * Orbit + axial-spin motion shared by every planet, driven imperatively so
+ * frequent parent re-renders can't stomp it. Returns how far the body is
+ * currently being inflated past true scale, which callers use to decide how
+ * much to light it from within.
+ */
+function useOrbitAndSpin(config: PlanetConfig, orbit: React.RefObject<Group | null>, spin: React.RefObject<Group | null>) {
+  const angle = useRef(0);
+  const spinAngle = useRef(0);
+  const inflation = useRef(1);
+  const worldPosition = useMemo(() => new Vector3(), []);
+  // Randomised once on mount, not during render, so every planet starts at a
+  // different point in its orbit without calling Math.random() while rendering.
+  useEffect(() => {
+    angle.current = Math.random() * Math.PI * 2;
+    spinAngle.current = Math.random() * Math.PI * 2;
+  }, []);
+
+  useFrame(({ camera, size }, delta) => {
+    angle.current += config.orbitSpeed * delta;
+    const group = orbit.current;
+    group?.position.set(
+      Math.cos(angle.current) * config.orbitRadius,
+      0,
+      Math.sin(angle.current) * config.orbitRadius,
+    );
+    spinAngle.current += config.spinSpeed * delta;
+    spin.current?.rotation.set(config.tilt, spinAngle.current, 0);
+
+    if (!group || !spin.current) return;
+    // Angular size of one pixel, then the world radius that fills the floor.
+    const perPixel = ((camera as PerspectiveCamera).fov * degrees) / size.height;
+    const distance = camera.position.distanceTo(group.getWorldPosition(worldPosition));
+    const floor = distance * perPixel * minimumPlanetPixels;
+    inflation.current = Math.max(1, floor / config.radius);
+    spin.current.scale.setScalar(inflation.current);
+  });
+
+  return inflation;
+}
+
+function Planet({ config }: { config: PlanetConfig }) {
+  const orbit = useRef<Group>(null);
+  const spin = useRef<Group>(null);
+  const material = useRef<MeshStandardMaterial>(null);
+  const inflation = useOrbitAndSpin(config, orbit, spin);
+  const texture = useMemo(() => createPlanetTexture(config), [config]);
+  useEffect(() => () => texture.dispose(), [texture]);
+
+  // Once a planet is being held at the floor size it is far enough away to be
+  // showing a phase, and a half-lit seven-pixel disc is easy to miss against
+  // black. Light it from within the more it is inflated, and hand it back to
+  // real sunlight as you close in.
+  useFrame(() => {
+    if (material.current) material.current.emissiveIntensity = Math.min(0.85, (inflation.current - 1) / 6);
+  });
+
+  return (
+    <group ref={orbit}>
+      <group ref={spin}>
+        <mesh>
+          <sphereGeometry args={[config.radius, 48, 48]} />
+          <meshStandardMaterial
+            ref={material}
+            map={texture}
+            emissiveMap={texture}
+            emissive="#ffffff"
+            emissiveIntensity={0}
+            roughness={0.88}
+            metalness={0.04}
+          />
+        </mesh>
+        {config.ring && <SaturnRing config={config.ring} />}
+      </group>
+    </group>
+  );
+}
+
+/** Orbits the globe rather than the sun, and is the one body out here you can see without leaving Earth. */
+function Moon() {
+  const orbit = useRef<Group>(null);
+  const spin = useRef<Group>(null);
+  useOrbitAndSpin(moonConfig, orbit, spin);
+  const texture = useMemo(() => createPlanetTexture(moonConfig), []);
+  useEffect(() => () => texture.dispose(), [texture]);
+
+  return (
+    <group ref={orbit}>
+      <group ref={spin}>
+        <mesh>
+          <sphereGeometry args={[moonConfig.radius, 48, 48]} />
+          <meshStandardMaterial map={texture} roughness={0.95} metalness={0.02} />
+        </mesh>
+      </group>
+    </group>
+  );
+}
+
+/**
+ * The real solar system, to scale against the globe: the sun is 109x its
+ * radius and sits one compressed astronomical unit away, with the planets at
+ * their true relative sizes and distances beyond it. Only the sun reads as a
+ * disc from here — the planets are the same bright pinpricks they are in a
+ * real sky, and seeing them up close means flying out (hold Shift to warp).
+ */
+function SolarSystem() {
+  return (
+    <group position={sunPosition}>
+      <Sun />
+      {solarSystemPlanets.map((planet) => <Planet key={planet.name} config={planet} />)}
+    </group>
+  );
+}
+
 function StructureTileMesh({ tile }: { tile: StructureTile }) {
   const geometry = useMemo(
     () => buildStructureGeometry(tile, mapSurfaceRadius),
@@ -783,7 +1272,7 @@ function StructureTileMesh({ tile }: { tile: StructureTile }) {
   if (!geometry) return null;
 
   return (
-    <mesh geometry={geometry} renderOrder={30} frustumCulled={false}>
+    <mesh geometry={geometry} renderOrder={30}>
       <meshStandardMaterial
         vertexColors
         side={DoubleSide}
@@ -861,7 +1350,9 @@ function DetailedStructures({ enabled }: { enabled: boolean }) {
   const [requests, setRequests] = useState<StructureTileRequest[]>([]);
   const [tileRevision, setTileRevision] = useState(0);
   const [terrainRevision, setTerrainRevision] = useState(0);
+  const [revealed, setRevealed] = useState<StructureTile[]>([]);
   const lastCheck = useRef(0);
+  const lastReveal = useRef(0);
   const viewDirection = useMemo(() => new Vector3(), []);
   const groundPoint = useMemo(() => new Vector3(), []);
 
@@ -870,6 +1361,30 @@ function DetailedStructures({ enabled }: { enabled: boolean }) {
 
   useFrame(() => {
     const now = performance.now();
+
+    // Several tiles can finish loading at the same instant (a burst of cache
+    // hits, or the loader's own debounced batch), and building all of their
+    // geometry synchronously in one React commit is what showed up as a
+    // stutter right as new ground came into view. So at most one newly-ready
+    // tile is handed to the renderer per tick here — and less often still
+    // when frames are already running long, which is exactly when a fresh
+    // triangulation pass can least be afforded.
+    const revealIntervalMs = getDetailScale() < 0.7 ? 260 : 90;
+    if (now - lastReveal.current >= revealIntervalMs) {
+      lastReveal.current = now;
+      setRevealed((current) => {
+        const wanted = new Set(requests.map((request) => request.key));
+        const kept = current.filter((tile) => wanted.has(tile.key));
+        const candidate = requests
+          .map(resolveStructureTile)
+          .find((tile): tile is StructureTile => (
+            tile !== null && !kept.some((visible) => visible.key === tile.key)
+          ));
+        if (kept.length === current.length && !candidate) return current;
+        return candidate ? [...kept, candidate] : kept;
+      });
+    }
+
     if (now - lastCheck.current < 350) return;
     lastCheck.current = now;
     if (!enabled) {
@@ -897,25 +1412,40 @@ function DetailedStructures({ enabled }: { enabled: boolean }) {
     else groundPoint.copy(camera.position).setLength(earthRadius);
 
     const focus = worldPointToMercator(groundPoint);
-    const radius = altitude > 0.0015 ? 2 : 1;
+    // Under sustained frame pressure, stop asking for the wider ring of tiles
+    // even where altitude would normally allow it. Fewer tiles to build and
+    // draw is the most direct lever back above the frame budget.
+    const radius = altitude > 0.0015 && getDetailScale() > 0.6 ? 2 : 1;
     const next = structureRequestsNear(focus.x, focus.y, radius);
     requestStructureTiles(next);
     setRequests((current) => (sameStructureRequests(current, next) ? current : next));
   });
 
   void tileRevision;
-  const loaded = requests
-    .map(resolveStructureTile)
-    .filter((tile): tile is StructureTile => tile !== null);
+  void terrainRevision;
+  const structureTileCount = 2 ** structureZoom;
+  // Trees are decorative; the first thing to go when frames are running long.
+  const lowDetail = getDetailScale() < 0.55;
 
   return (
     <>
-      {loaded.map((tile) => (
-        <group key={`${tile.key}:${terrainRevision}`}>
-          <StructureTileMesh tile={tile} />
-          <ForestTile tile={tile} />
-        </group>
-      ))}
+      {revealed.map((tile) => {
+        // Rebuilding is expensive (re-triangulating every building), so a tile
+        // only remounts once the terrain actually under it gets sharper — not
+        // whenever any DEM tile anywhere on the globe finishes loading. Without
+        // this, a burst of unrelated terrain arrivals while zooming forced every
+        // visible tile to rebuild together, which is what was freezing the view.
+        const terrainZoom = finestTerrainZoomAtMercator(
+          (tile.x + 0.5) / structureTileCount,
+          (tile.y + 0.5) / structureTileCount,
+        );
+        return (
+          <group key={`${tile.key}:${terrainZoom}`}>
+            <StructureTileMesh tile={tile} />
+            {!lowDetail && <ForestTile tile={tile} />}
+          </group>
+        );
+      })}
     </>
   );
 }
@@ -968,6 +1498,8 @@ function useCallsignLookup(callsign: string | null) {
   return { route, found, loading };
 }
 
+const networkPollMs = 5_000;
+
 // The patch of globe the camera can actually see, expressed the way the ADS-B
 // networks want it: a centre point and a radius in nautical miles.
 function cameraFootprint(position: [number, number, number]) {
@@ -1012,16 +1544,25 @@ function useNetworkAircraft(enabled: boolean, globalSweep: boolean, cameraPositi
 
     const load = async () => {
       try {
+        const sentAtMs = Date.now();
         const response = await fetch(`/api/flight-network?${query}`, { cache: 'no-store' });
         if (!response.ok) throw new Error('network feed unavailable');
-        const data = (await response.json()) as { aircraft: Aircraft[]; sources: string[] };
+        const data = (await response.json()) as {
+          aircraft: Aircraft[];
+          sources: string[];
+          serverTime: number;
+        };
         if (cancelled) return;
+        syncFlightClock(data.serverTime, sentAtMs);
         setAircraft(data.aircraft);
         setSources(data.sources ?? []);
       } catch {
         // Leave the previous result on screen; the next tick may succeed.
       }
-      if (!cancelled) timer = setTimeout(load, globalSweep ? 60_000 : 25_000);
+      // The aggregators republish about once a second and the server holds a
+      // region for four, so this is the cadence at which genuinely new fixes
+      // exist to collect. A whole globe sweep is far too heavy for that pace.
+      if (!cancelled) timer = setTimeout(load, globalSweep ? 60_000 : networkPollMs);
     };
 
     void load();
@@ -1672,77 +2213,136 @@ function FlightRoutePath({ route }: { route: FlightRoute }) {
   );
 }
 
-function FlyMovement({ active, speed }: { active: boolean; speed: number }) {
-  const { camera } = useThree();
+const pointerLookSensitivity = 0.0011;
+
+function FreeFlightController({
+  active,
+  speed,
+  onActiveChange,
+}: {
+  active: boolean;
+  speed: number;
+  onActiveChange: (active: boolean) => void;
+}) {
+  const { camera, gl } = useThree();
   const keys = useRef(new Set<string>());
-  const forward = useMemo(() => new Vector3(), []);
-  const right = useMemo(() => new Vector3(), []);
-  const localUp = useMemo(() => new Vector3(), []);
-  const thrust = useMemo(() => new Vector3(), []);
+  const orientation = useRef(new Euler(0, 0, 0, 'YXZ'));
+  const forward = useRef(new Vector3());
+  const right = useRef(new Vector3());
+  const thrust = useRef(new Vector3());
 
   useEffect(() => {
-    const down = (event: KeyboardEvent) => keys.current.add(event.code);
+    const canvas = gl.domElement;
+    const flyButton = document.querySelector<HTMLElement>('#fly-mode-button');
+
+    const enterFreeFlight = () => {
+      try {
+        // Some embedded browsers reject pointer lock. Consume that rejection so
+        // unsupported hosts fail quietly instead of crashing the application.
+        void Promise.resolve(canvas.requestPointerLock()).catch(() => onActiveChange(false));
+      } catch {
+        onActiveChange(false);
+      }
+    };
+
+    const pointerLockChanged = () => {
+      const locked = document.pointerLockElement === canvas;
+      if (locked) {
+        // Orbit mode may hand over a rolled camera. Level it once on entry;
+        // from here on, look rotates the camera around its OWN current axes
+        // (see `look` below) rather than any world reference, so there is no
+        // "up" to lose track of and therefore nothing for it to flip against.
+        camera.up.set(0, 1, 0);
+        orientation.current.setFromQuaternion(camera.quaternion, 'YXZ');
+        orientation.current.z = 0;
+        camera.quaternion.setFromEuler(orientation.current);
+      }
+      onActiveChange(locked);
+    };
+
+    const look = (event: MouseEvent) => {
+      if (document.pointerLockElement !== canvas) return;
+
+      // Pitch and yaw both rotate around the camera's own current local axes
+      // (three.js's built-in rotateX/rotateY), never a fixed world axis. A
+      // free-floating camera has nothing to stay "upright" relative to, so
+      // looking straight up and continuing just loops it over — no flip, no
+      // limit, and left/right always strafes to whatever is now on-screen.
+      camera.rotateX(-event.movementY * pointerLookSensitivity);
+      camera.rotateY(-event.movementX * pointerLookSensitivity);
+      camera.quaternion.normalize();
+    };
+
+    flyButton?.addEventListener('click', enterFreeFlight);
+    document.addEventListener('pointerlockchange', pointerLockChanged);
+    document.addEventListener('mousemove', look);
+    return () => {
+      flyButton?.removeEventListener('click', enterFreeFlight);
+      document.removeEventListener('pointerlockchange', pointerLockChanged);
+      document.removeEventListener('mousemove', look);
+    };
+  }, [camera, gl, onActiveChange]);
+
+  useEffect(() => {
+    if (!active) {
+      keys.current.clear();
+      return;
+    }
+
+    const down = (event: KeyboardEvent) => {
+      keys.current.add(event.code);
+      if (event.code.startsWith('Arrow') || event.code === 'Space') event.preventDefault();
+    };
     const up = (event: KeyboardEvent) => keys.current.delete(event.code);
+    const clear = () => keys.current.clear();
     window.addEventListener('keydown', down);
     window.addEventListener('keyup', up);
+    window.addEventListener('blur', clear);
     return () => {
       window.removeEventListener('keydown', down);
       window.removeEventListener('keyup', up);
-      keys.current.clear();
+      window.removeEventListener('blur', clear);
+      clear();
     };
-  }, []);
-
-  // Free flight keeps the horizon level: the mouse only ever changes where the
-  // camera points, never how it is rolled, so any tilt another mode left behind
-  // is taken out on the way in rather than riding along for the whole flight.
-  useEffect(() => {
-    if (!active) return;
-    const level = new Euler(0, 0, 0, 'YXZ').setFromQuaternion(camera.quaternion, 'YXZ');
-    if (level.z === 0) return;
-    level.z = 0;
-    camera.quaternion.setFromEuler(level);
-  }, [active, camera]);
+  }, [active]);
 
   useFrame((_, rawDelta) => {
     if (!active) return;
     const delta = Math.min(rawDelta, 0.1);
     const held = keys.current;
-    const groundRadius = terrainSurfaceRadiusAt(camera.position, mapSurfaceRadius);
-    const altitude = Math.max(camera.position.length() - groundRadius, minimumCameraAltitude);
-    const precisionSpeed = proximitySpeedFor(altitude);
-    const cruiseSpeed = speed * precisionSpeed
-      * (held.has('ShiftLeft') || held.has('ShiftRight') ? 3 : 1);
+    // Shift is a warp, not a sprint. The solar system is genuinely to scale —
+    // Jupiter is ~29,000 units out and Neptune past 169,000 — so the throttle's
+    // normal range stays tuned for flying around the globe, and this multiplier
+    // is what turns an interplanetary leg into seconds instead of an hour.
+    const cruiseSpeed = speed
+      * (held.has('ShiftLeft') || held.has('ShiftRight') ? interplanetaryWarp : 1);
 
-    const turn = Number(held.has('KeyQ') || held.has('KeyA') || held.has('ArrowLeft'))
-      - Number(held.has('KeyD') || held.has('ArrowRight'));
-    if (turn !== 0) {
-      // Rotate around the camera's own up axis so left/right always stays a
-      // horizontal turn, even after entering fly mode from an angled globe view.
-      camera.rotateY(turn * flyYawSpeed * delta);
-    }
+    // These axes belong only to the camera. Earth position, terrain altitude,
+    // aircraft state and the current orbit target never enter the movement
+    // calculation. Pointer-lock mouse look is the only thing that rotates them.
+    forward.current.set(0, 0, -1).applyQuaternion(camera.quaternion);
+    right.current.set(1, 0, 0).applyQuaternion(camera.quaternion);
 
-    camera.getWorldDirection(forward).normalize();
-    right.crossVectors(forward, camera.up).normalize();
-    localUp.crossVectors(right, forward).normalize();
+    thrust.current.set(0, 0, 0);
+    if (held.has('KeyZ') || held.has('KeyW') || held.has('ArrowUp')) thrust.current.addScaledVector(forward.current, 1);
+    if (held.has('KeyS') || held.has('ArrowDown')) thrust.current.addScaledVector(forward.current, -1);
+    if (held.has('KeyQ') || held.has('KeyA') || held.has('ArrowLeft')) thrust.current.addScaledVector(right.current, -1);
+    if (held.has('KeyD') || held.has('ArrowRight')) thrust.current.addScaledVector(right.current, 1);
+    if (held.has('Space') || held.has('KeyR') || held.has('KeyE')) thrust.current.y += 1;
+    if (held.has('ControlLeft') || held.has('ControlRight') || held.has('KeyF') || held.has('KeyC')) thrust.current.y -= 1;
+    if (thrust.current.lengthSq() === 0) return;
 
-    thrust.set(0, 0, 0);
-    if (held.has('KeyZ') || held.has('KeyW') || held.has('ArrowUp')) thrust.addScaledVector(forward, 1);
-    if (held.has('KeyS') || held.has('ArrowDown')) thrust.addScaledVector(forward, -1);
-    if (held.has('Space') || held.has('KeyR') || held.has('KeyE')) thrust.addScaledVector(localUp, 1);
-    if (held.has('ControlLeft') || held.has('ControlRight') || held.has('KeyF') || held.has('KeyC')) thrust.addScaledVector(localUp, -1);
-    if (thrust.lengthSq() === 0) return;
-
-    // Movement is exactly the throttle setting for as long as a key is held and
-    // nothing at all on the frame it is released — no momentum carrying the
-    // camera past what it was aimed at, no bank into a turn, no lens flex under
-    // speed.
-    camera.position.addScaledVector(thrust.normalize(), cruiseSpeed * delta);
+    // No steering, momentum, banking or altitude scaling: a held direction
+    // moves at exactly the selected speed. EarthSurfaceCollision still stops
+    // this at the ground, the one check every movement mode shares.
+    camera.position.addScaledVector(thrust.current.normalize(), cruiseSpeed * delta);
   });
 
   return null;
 }
 
 function CameraDirector({
+  suspended,
   selected,
   predictive,
   follow,
@@ -1751,6 +2351,7 @@ function CameraDirector({
   motionScale,
   onPosition,
 }: {
+  suspended: boolean;
   selected: Aircraft | null;
   predictive: boolean;
   follow: boolean;
@@ -1768,13 +2369,13 @@ function CameraDirector({
   const radial = useMemo(() => new Vector3(), []);
 
   useFrame(() => {
-    if (lastReset.current !== resetRequest) {
+    if (!suspended && lastReset.current !== resetRequest) {
       lastReset.current = resetRequest;
       camera.position.set(0, 0.3, 6.7);
       camera.lookAt(0, 0, 0);
     }
 
-    if (selected && lastFocus.current !== focusRequest) {
+    if (!suspended && selected && lastFocus.current !== focusRequest) {
       lastFocus.current = focusRequest;
       globePosition(selected, preciseNowSeconds(), predictive, 0, target, motionScale);
       radial.copy(target).normalize();
@@ -1782,7 +2383,7 @@ function CameraDirector({
       camera.lookAt(target);
     }
 
-    if (follow && selected) {
+    if (!suspended && follow && selected) {
       globePosition(selected, preciseNowSeconds(), predictive, 0, target, motionScale);
       radial.copy(target).normalize();
       desired.copy(target).addScaledVector(radial, 0.027);
@@ -1848,8 +2449,13 @@ function AltitudeScaledControls({
   return null;
 }
 
-function EarthSurfaceCollision() {
+function EarthSurfaceCollision({
+  controlsRef,
+}: {
+  controlsRef: React.RefObject<OrbitControlsHandle | null>;
+}) {
   const { camera } = useThree();
+  const previousPosition = useMemo(() => new Vector3(), []);
 
   useFrame(() => {
     const distance = camera.position.length();
@@ -1857,12 +2463,20 @@ function EarthSurfaceCollision() {
     const minimumRadius = Math.max(minimumCameraRadius, terrainRadius + minimumCameraAltitude);
     if (distance >= minimumRadius) return;
 
-    if (distance < 1e-9) {
-      camera.position.set(minimumRadius, 0, 0);
-      return;
-    }
+    previousPosition.copy(camera.position);
+    if (distance < 1e-9) camera.position.set(minimumRadius, 0, 0);
+    else camera.position.multiplyScalar(minimumRadius / distance);
 
-    camera.position.multiplyScalar(minimumRadius / distance);
+    // Orbiting or panning routinely leaves the controls' pivot well away from
+    // the globe's centre, so pushing the camera straight out from that centre
+    // — the only correction that means anything for ground clearance — also
+    // changes the camera's position relative to the pivot. Left alone, the
+    // next orbit update re-derives its look direction from that new relative
+    // position and the view swings to match: a barely-there position fix that
+    // reads as the camera suddenly spinning in place. Carrying the pivot along
+    // by the same offset keeps the relative position, and so the view
+    // direction, exactly what it was.
+    controlsRef.current?.target.add(camera.position.clone().sub(previousPosition));
   });
 
   return null;
@@ -1914,7 +2528,7 @@ function GlobeScene({
   return (
     <>
       <color attach="background" args={['#02070c']} />
-      <fog attach="fog" args={['#02070c', 11, 30]} />
+      <PerformanceGovernor />
       <ambientLight intensity={0.68} />
       <directionalLight position={[5, 2, 4]} intensity={3.15} color={new Color('#d9f4ff')} />
       <pointLight position={[-4, -1, -3]} intensity={2.1} color="#0a4f7c" />
@@ -1928,6 +2542,8 @@ function GlobeScene({
         <Suspense fallback={null}><FlightRoutePath key={`${selected.id}-route`} route={route} /></Suspense>
       )}
       <Stars radius={70} depth={38} count={2400} factor={2.1} saturation={0.25} fade speed={0.2} />
+      <Moon />
+      <SolarSystem />
       <OrbitControls
         ref={orbitControlsRef}
         makeDefault={!flyMode}
@@ -1937,20 +2553,14 @@ function GlobeScene({
         rotateSpeed={baseOrbitRotateSpeed * orbitSpeed}
         panSpeed={baseOrbitPanSpeed * orbitSpeed}
         minDistance={minimumCameraAltitude}
-        maxDistance={30}
+        maxDistance={20000}
         enablePan
         target={orbitTarget}
       />
-      <PointerLockControls
-        selector="#fly-mode-button"
-        pointerSpeed={0.55}
-        onLock={() => onFlyMode(true)}
-        onUnlock={() => onFlyMode(false)}
-      />
-      <FlyMovement active={flyMode} speed={speed} />
-      <CameraDirector selected={selected} predictive={predictive} follow={follow} focusRequest={focusRequest} resetRequest={resetRequest} motionScale={motionScale} onPosition={onPosition} />
+      <FreeFlightController active={flyMode} speed={speed} onActiveChange={onFlyMode} />
+      <CameraDirector suspended={flyMode} selected={selected} predictive={predictive} follow={follow} focusRequest={focusRequest} resetRequest={resetRequest} motionScale={motionScale} onPosition={onPosition} />
       <AltitudeScaledControls controlsRef={orbitControlsRef} speedMultiplier={orbitSpeed} />
-      <EarthSurfaceCollision />
+      <EarthSurfaceCollision controlsRef={orbitControlsRef} />
     </>
   );
 }
@@ -2162,16 +2772,24 @@ export function AirTrafficApp() {
   const [refreshKey, setRefreshKey] = useState(0);
   const { aircraft: feedAircraft, state: feedState, error, meta } = useAircraftFeed(refreshKey);
   const [externalAircraft, setExternalAircraft] = useState<Aircraft[]>([]);
-  const [useNetworks, setUseNetworks] = useState(false);
+  // On by default: OpenSky's global snapshot is paced by a daily credit
+  // allowance and cannot refresh faster than about ninety seconds, so it alone
+  // leaves the globe animating dead reckoning between distant fixes. The
+  // community aggregators republish about once a second and are what make the
+  // aircraft you are actually looking at move from real positions.
+  const [useNetworks, setUseNetworks] = useState(true);
   const [globalSweep, setGlobalSweep] = useState(false);
   const [cameraPosition, setCameraPosition] = useState<[number, number, number]>([0, 0.3, 6.7]);
   const { aircraft: networkAircraft, sources: networkSources } = useNetworkAircraft(useNetworks, globalSweep, cameraPosition);
 
   const aircraft = useMemo(() => {
-    // OpenSky is the primary health signal. Optional network/search results must
-    // never leave aircraft on the globe when that primary feed is offline.
-    if (feedState !== 'live' && feedState !== 'stale') return [];
-    if (networkAircraft.length === 0 && externalAircraft.length === 0) return feedAircraft;
+    // The community networks are a live feed in their own right rather than a
+    // garnish on OpenSky. Gating every aircraft on OpenSky's health emptied the
+    // globe during an outage even while the real-time networks were answering
+    // normally, hiding working data behind a broken source.
+    if (networkAircraft.length === 0 && externalAircraft.length === 0) {
+      return feedState === 'live' || feedState === 'stale' ? feedAircraft : [];
+    }
     // The same airframe can arrive from OpenSky and a community network at once;
     // keep whichever fix is newer so the globe shows the best available position.
     const merged = new Map<string, Aircraft>();
@@ -2202,6 +2820,7 @@ export function AirTrafficApp() {
   const [resetRequest, setResetRequest] = useState(0);
   const [orbitTarget, setOrbitTarget] = useState<[number, number, number]>([0, 0, 0]);
   const [utc, setUtc] = useState('00:00:00');
+  const [fps, setFps] = useState(60);
   const searchRef = useRef<HTMLInputElement>(null);
   const selectedPanelRef = useRef<HTMLElement>(null);
   const { lists: favoriteLists, setLists: setFavoriteLists } = useFavoriteLists();
@@ -2211,9 +2830,16 @@ export function AirTrafficApp() {
   const { route, loading: routeLoading } = useFlightRoute(selected);
   const selectedProfile = useAircraftProfile(selected?.id ?? null);
   useEffect(() => {
-    const update = () => setUtc(new Date().toISOString().slice(11, 19));
+    // Read from the corrected clock, not this machine's: a browser hours out of
+    // step would otherwise print an hours-wrong UTC beside correct aircraft ages.
+    const update = () => setUtc(new Date(preciseNowSeconds() * 1000).toISOString().slice(11, 19));
     update();
     const timer = window.setInterval(update, 1000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setFps(Math.round(getFps())), 400);
     return () => window.clearInterval(timer);
   }, []);
 
@@ -2232,11 +2858,16 @@ export function AirTrafficApp() {
   }, [selected]);
 
   useEffect(() => {
+    // Re-point the selection at the newest fix for the same airframe on every
+    // refresh, so an open panel keeps updating rather than pinning the aircraft
+    // to the position it held when it was clicked. Losing every source at once
+    // is what drops the selection — not one of them going quiet.
     setSelected((current) => {
-      if (!current || (feedState !== 'live' && feedState !== 'stale')) return null;
+      if (!current) return null;
+      if (aircraft.length === 0) return null;
       return aircraft.find((flight) => flight.id === current.id) ?? current;
     });
-  }, [aircraft, feedState]);
+  }, [aircraft]);
 
   useEffect(() => {
     const shortcut = (event: KeyboardEvent) => {
@@ -2319,6 +2950,13 @@ export function AirTrafficApp() {
     setSearchFocused(false);
   }, []);
 
+  const setFreeFlight = useCallback((active: boolean) => {
+    setFlyMode(active);
+    // Entering free flight explicitly detaches the camera from any aircraft
+    // that was being followed, including after pointer lock is released.
+    if (active) setFollow(false);
+  }, []);
+
   const createFavoriteList = () => {
     const name = newListName.trim();
     if (!name) return;
@@ -2379,11 +3017,15 @@ export function AirTrafficApp() {
   const selectedModel = selected?.model ?? selectedProfile?.icaoType ?? null;
   const lastContactAge = selected ? Math.max(0, nowSeconds() - selected.lastContact) : 0;
   const sourceAge = meta ? Math.max(0, nowSeconds() - meta.sourceTimestamp) : 0;
+  // Every age and clock on screen is measured in feed time, which the app
+  // corrects for itself. Worth reporting when this machine disagrees by enough
+  // to notice, since otherwise the panel silently contradicts the system tray.
+  const clockSkew = Math.round(clockOffsetSeconds());
 
   return (
     <main className="relative h-dvh w-full overflow-hidden bg-[#02070c] text-slate-100 selection:bg-cyan-300/25">
       <div className="absolute inset-0">
-        <Canvas camera={{ position: [0, 0.3, 6.7], fov: 43, near: 0.000002, far: 150 }} dpr={[1, 2]} gl={{ antialias: true, logarithmicDepthBuffer: true, powerPreference: 'high-performance' }}>
+        <Canvas camera={{ position: [0, 0.3, 6.7], fov: 43, near: 0.000002, far: 400000 }} dpr={[1, 2]} gl={{ antialias: true, logarithmicDepthBuffer: true, powerPreference: 'high-performance' }}>
           <GlobeScene
             aircraft={filteredAircraft}
             selected={selected}
@@ -2401,7 +3043,7 @@ export function AirTrafficApp() {
             showStructures={showStructures}
             countryGeo={countryGeo}
             motionScale={motionSpeed[0]}
-            onFlyMode={setFlyMode}
+            onFlyMode={setFreeFlight}
             onPosition={setCameraPosition}
             onSelect={selectFlight}
           />
@@ -2502,14 +3144,14 @@ export function AirTrafficApp() {
       {helpOpen && (
         <div id="free-flight-controls" className="pointer-events-auto absolute right-4 top-[78px] z-30 w-[300px] border border-cyan-300/20 bg-[#061018]/95 p-4 shadow-2xl backdrop-blur-xl sm:right-6">
           <div className="flex items-center"><Navigation className="mr-2 size-4 text-cyan-300" /><h2 className="text-[11px] font-semibold tracking-[0.15em]">FREE-FLIGHT CONTROLS</h2><button onClick={() => setHelpOpen(false)} className="ml-auto text-slate-500 hover:text-white"><X className="size-4" /></button></div>
-          <p className="mt-3 text-xs leading-5 text-slate-400">Select <span className="text-cyan-200">FLY</span>, then use the mouse to look anywhere. Press Esc to release the mouse.</p>
+          <p className="mt-3 text-xs leading-5 text-slate-400">Select <span className="text-cyan-200">FLY</span>, then use the mouse to look freely up, down and around. Press Esc to release the mouse.</p>
           <div className="mt-4 grid grid-cols-[1fr_auto] gap-y-3 text-[11px] text-slate-400">
             <span>Forward / back</span><span className="flex gap-1"><Key>Z/W</Key><Key>S</Key><Key>↑↓</Key></span>
-            <span>Turn left / right</span><span className="flex gap-1"><Key>Q/A</Key><Key>D</Key><Key>←→</Key></span>
+            <span>Strafe left / right</span><span className="flex gap-1"><Key>Q/A</Key><Key>D</Key><Key>←→</Key></span>
             <span>Rise / descend</span><span className="flex gap-1"><Key>SPACE</Key><Key>CTRL</Key></span>
             <span>Move faster</span><span className="flex gap-1"><Key>SHIFT</Key></span>
           </div>
-          <div className="mt-4 border-t border-white/[0.08] pt-3"><div className="mb-2 flex justify-between"><span className="telemetry-label">Camera speed</span><span className="font-mono text-[9px] text-cyan-200">{formatCameraSpeed(flySpeed)} u/s</span></div><Slider min={0} max={1} step={0.01} value={flyThrottle} onValueChange={(value) => setFlyThrottle(toSliderTuple(value))} /><div className="mt-1.5 flex justify-between font-mono text-[8px] tracking-wider text-slate-600"><span>PRECISION</span><span>SHIFT FOR ×3</span><span>DASH</span></div><p className="mt-2 text-[9px] leading-4 text-slate-600">Applies to orbit and free flight. Movement automatically becomes finer as you approach the ground.</p></div>
+          <div className="mt-4 border-t border-white/[0.08] pt-3"><div className="mb-2 flex justify-between"><span className="telemetry-label">Camera speed</span><span className="font-mono text-[9px] text-cyan-200">{formatCameraSpeed(flySpeed)} u/s</span></div><Slider min={0} max={1} step={0.01} value={flyThrottle} onValueChange={(value) => setFlyThrottle(toSliderTuple(value))} /><div className="mt-1.5 flex justify-between font-mono text-[8px] tracking-wider text-slate-600"><span>PRECISION</span><span>SHIFT FOR ×3</span><span>DASH</span></div><p className="mt-2 text-[9px] leading-4 text-slate-600">Free flight keeps this exact speed everywhere. Orbit controls still slow near the ground for precision.</p></div>
         </div>
       )}
 
@@ -2616,14 +3258,14 @@ export function AirTrafficApp() {
             <label className="flex items-center justify-between py-1.5 text-xs text-slate-300"><span>Selected flight path</span><Switch checked={paths} onCheckedChange={setPaths} className="data-checked:bg-cyan-300" /></label>
             <div className="flex items-center justify-between py-1.5 text-xs text-slate-300"><span>3D buildings, bridges & forests</span><Switch checked={showStructures} onCheckedChange={setShowStructures} className="data-checked:bg-cyan-300" aria-label="Toggle 3D buildings, bridges, and forests" /></div>
             <label className="flex items-center justify-between py-1.5 text-xs text-slate-300"><span>Extra country outlines</span><Switch checked={showCountries} onCheckedChange={setShowCountries} className="data-checked:bg-cyan-300" /></label>
-            <label className="flex items-center justify-between py-1.5 text-xs text-slate-300"><span>Extended ADS-B networks</span><Switch checked={useNetworks} onCheckedChange={setUseNetworks} className="data-checked:bg-cyan-300" /></label>
+            <label className="flex items-center justify-between py-1.5 text-xs text-slate-300"><span>Real-time ADS-B networks</span><Switch checked={useNetworks} onCheckedChange={setUseNetworks} className="data-checked:bg-cyan-300" /></label>
             {useNetworks && (
               <>
                 <label className="flex items-center justify-between py-1.5 pl-3 text-xs text-slate-400"><span>Sweep the whole globe</span><Switch checked={globalSweep} onCheckedChange={setGlobalSweep} className="data-checked:bg-amber-200" /></label>
                 <p className="mt-1 pl-3 text-[9px] leading-4 text-slate-600">
                   {globalSweep
                     ? 'Twelve wide queries cover the planet every 60s — a complete picture, but several megabytes per sweep.'
-                    : 'Only the airspace you are looking at is fetched, refreshed every 25s as you pan and zoom.'}
+                    : 'Only the airspace you are looking at is fetched, with a fresh fix every 5s as you pan and zoom. This is what moves aircraft in real time; OpenSky alone can only refresh globally about every 90s.'}
                 </p>
               </>
             )}
@@ -2638,7 +3280,7 @@ export function AirTrafficApp() {
           </section>
           <section className="border-t border-white/[0.08] pt-4">
             <p className="telemetry-label mb-2">Data link</p>
-            <div className="space-y-1.5 font-mono text-[9px] tracking-wider text-slate-500"><div className="flex justify-between"><span>SOURCE</span><span className="text-slate-300">OPENSKY{networkSources.length > 0 ? ` +${networkSources.length}` : ''}</span></div>{networkSources.length > 0 && <div className="flex justify-between"><span>ALSO</span><span className="text-cyan-200">{networkSources.join(' · ').toUpperCase()}</span></div>}<div className="flex justify-between"><span>ACCESS</span><span className={meta?.mode === 'authenticated' ? 'text-lime-200' : 'text-amber-200'}>{meta?.mode?.toUpperCase() ?? 'CONNECTING'}</span></div><div className="flex justify-between"><span>DATA AGE</span><span className="text-slate-300">{meta ? `${sourceAge}s` : '—'}</span></div></div>
+            <div className="space-y-1.5 font-mono text-[9px] tracking-wider text-slate-500"><div className="flex justify-between"><span>SOURCE</span><span className="text-slate-300">OPENSKY{networkSources.length > 0 ? ` +${networkSources.length}` : ''}</span></div>{networkSources.length > 0 && <div className="flex justify-between"><span>ALSO</span><span className="text-cyan-200">{networkSources.join(' · ').toUpperCase()}</span></div>}<div className="flex justify-between"><span>ACCESS</span><span className={meta?.mode === 'authenticated' ? 'text-lime-200' : 'text-amber-200'}>{meta?.mode?.toUpperCase() ?? 'CONNECTING'}</span></div><div className="flex justify-between"><span>DATA AGE</span><span className="text-slate-300">{meta ? `${sourceAge}s` : '—'}</span></div>{Math.abs(clockSkew) >= 30 && <div className="flex justify-between"><span>CLOCK</span><span className="text-amber-200">PC {clockSkew > 0 ? 'SLOW' : 'FAST'} {formatDuration(Math.abs(clockSkew))}</span></div>}</div>
             <p className="mt-3 text-[9px] leading-4 text-slate-600">Community receiver coverage varies by region; not every aircraft broadcasts a public position.</p>
           </section>
         </div>
@@ -2754,7 +3396,7 @@ export function AirTrafficApp() {
 
       <footer className="pointer-events-none absolute inset-x-0 bottom-0 z-30 flex h-10 items-center border-t border-white/[0.08] bg-[#030a10]/82 px-4 font-mono text-[9px] tracking-wider text-slate-600 backdrop-blur-xl sm:px-6">
         <span className="flex items-center gap-2"><Radio className={`size-3 ${feedState === 'live' ? 'text-cyan-300' : 'text-amber-300'}`} /> {feedState === 'live' ? 'OPENSKY LIVE NETWORK' : feedState === 'connecting' ? 'OPENSKY CONNECTION PENDING' : feedState === 'stale' ? 'OPENSKY REFRESH DELAYED' : 'OPENSKY OFFLINE'}</span><span className="mx-4 hidden h-3 w-px bg-white/10 sm:block" /><span className="hidden sm:inline">UTC {utc}</span><span className="ml-4 hidden text-slate-700 xl:inline">EARTH / FULL 3D SCENE</span>
-        <div className="ml-auto flex items-center gap-4"><span className="hidden items-center gap-1.5 md:flex"><Activity className="size-3 text-lime-300" /> {motionSpeed[0] === 1 ? 'TRUE-SPEED LIVE MOTION' : `${motionSpeed[0]}× TIME-LAPSE MOTION`}</span><span className="hidden items-center gap-1.5 xl:flex">{meta ? `${meta.refreshAfter}s SOURCE SYNC` : 'CONNECTING'}</span><span className="hidden items-center gap-1.5 lg:flex"><ArrowUpFromLine className="size-3" /> SPACE</span><span className="hidden items-center gap-1.5 lg:flex"><ArrowDownToLine className="size-3" /> CTRL</span><span className="flex items-center gap-1.5"><Gauge className="size-3" /> 60 FPS</span></div>
+        <div className="ml-auto flex items-center gap-4"><span className="hidden items-center gap-1.5 md:flex"><Activity className="size-3 text-lime-300" /> {motionSpeed[0] === 1 ? 'TRUE-SPEED LIVE MOTION' : `${motionSpeed[0]}× TIME-LAPSE MOTION`}</span><span className="hidden items-center gap-1.5 xl:flex">{meta ? `${meta.refreshAfter}s SOURCE SYNC` : 'CONNECTING'}</span><span className="hidden items-center gap-1.5 lg:flex"><ArrowUpFromLine className="size-3" /> SPACE</span><span className="hidden items-center gap-1.5 lg:flex"><ArrowDownToLine className="size-3" /> CTRL</span><span className="flex items-center gap-1.5"><Gauge className={`size-3 ${fps < 30 ? 'text-amber-300' : ''}`} /> {fps} FPS</span></div>
       </footer>
     </main>
   );

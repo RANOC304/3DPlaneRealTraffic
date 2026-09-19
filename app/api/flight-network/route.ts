@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 
 import { type NetworkAircraft, queryNetworks } from '@/lib/adsb';
+import { preciseNowSeconds } from '@/lib/flight-clock';
 
 // Twelve 3000nm caps cover the planet with overlap. Ordered so the busiest
 // airspace lands first, which matters because a sweep is paced.
@@ -10,12 +11,18 @@ const globeTiles: Array<[number, number]> = [
 ];
 
 const tileRadiusNm = 3000;
-const regionTtlMs = 25_000;
+// These aggregators republish roughly once a second, which is the whole reason
+// this endpoint exists: it is the only feed in the app capable of showing an
+// aircraft where it actually is right now. Holding a region for much longer
+// than the upstream takes to change would throw that away and leave the globe
+// animating dead reckoning between fixes it already had.
+const regionTtlMs = 4_000;
 const globalTtlMs = 60_000;
 
 type CacheEntry = { aircraft: NetworkAircraft[]; expiresAt: number; sources: string[] };
 
 const cache = new Map<string, CacheEntry>();
+const inflight = new Map<string, Promise<CacheEntry>>();
 let globalSweep: Promise<CacheEntry> | null = null;
 
 function cached(key: string) {
@@ -25,7 +32,14 @@ function cached(key: string) {
 
 function respond(entry: CacheEntry, hit: boolean) {
   return NextResponse.json(
-    { aircraft: entry.aircraft, count: entry.aircraft.length, sources: entry.sources },
+    {
+      aircraft: entry.aircraft,
+      count: entry.aircraft.length,
+      sources: entry.sources,
+      // Stamped per response, never cached: this is what lets the browser correct
+      // its own clock against the time base the positions are measured in.
+      serverTime: preciseNowSeconds(),
+    },
     { headers: { 'cache-control': 'private, no-store', 'x-skytrace-network-cache': hit ? 'hit' : 'miss' } },
   );
 }
@@ -35,8 +49,13 @@ async function sweepGlobe(): Promise<CacheEntry> {
   const sources = new Set<string>();
 
   for (const [lat, lon] of globeTiles) {
-    const { aircraft, source } = await queryNetworks(`/point/${lat}/${lon}/${tileRadiusNm}`);
-    if (source) sources.add(source);
+    const { aircraft, sources: tileSources } = await queryNetworks({
+      kind: 'point',
+      lat,
+      lon,
+      radiusNm: tileRadiusNm,
+    });
+    for (const source of tileSources) sources.add(source);
     for (const flight of aircraft) {
       const existing = merged.get(flight.id);
       // Overlapping caps return the same airframe; keep the freshest fix.
@@ -52,6 +71,20 @@ async function sweepGlobe(): Promise<CacheEntry> {
     sources: [...sources],
   };
   cache.set('global', entry);
+  return entry;
+}
+
+async function loadRegion(key: string, lat: number, lon: number, radiusNm: number): Promise<CacheEntry> {
+  const { aircraft, sources } = await queryNetworks({ kind: 'point', lat, lon, radiusNm });
+  const entry: CacheEntry = { aircraft, expiresAt: Date.now() + regionTtlMs, sources };
+  cache.set(key, entry);
+
+  // The map is keyed by viewport, so evict the oldest entries rather than let it
+  // grow for the life of the worker.
+  if (cache.size > 40) {
+    const oldest = [...cache.entries()].sort((a, b) => a[1].expiresAt - b[1].expiresAt)[0];
+    if (oldest && oldest[0] !== 'global') cache.delete(oldest[0]);
+  }
   return entry;
 }
 
@@ -85,20 +118,13 @@ export async function GET(request: NextRequest) {
   const hit = cached(key);
   if (hit) return respond(hit, true);
 
-  const { aircraft, source } = await queryNetworks(`/point/${keyLat}/${keyLon}/${keyRadius}`);
-  const entry: CacheEntry = {
-    aircraft,
-    expiresAt: Date.now() + regionTtlMs,
-    sources: source ? [source] : [],
-  };
-  cache.set(key, entry);
-
-  // The map is keyed by viewport, so evict the oldest entries rather than let it
-  // grow for the life of the worker.
-  if (cache.size > 40) {
-    const oldest = [...cache.entries()].sort((a, b) => a[1].expiresAt - b[1].expiresAt)[0];
-    if (oldest && oldest[0] !== 'global') cache.delete(oldest[0]);
+  // At a four-second window every browser watching one region would otherwise
+  // arrive during the same upstream request. One request answers all of them.
+  let pending = inflight.get(key);
+  if (!pending) {
+    pending = loadRegion(key, keyLat, keyLon, keyRadius).finally(() => { inflight.delete(key); });
+    inflight.set(key, pending);
   }
 
-  return respond(entry, false);
+  return respond(await pending, false);
 }

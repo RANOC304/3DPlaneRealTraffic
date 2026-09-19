@@ -53,8 +53,12 @@ const liveKeys = new Set<string>();
 const listeners = new Set<() => void>();
 const maximumConcurrentLoads = 4;
 const tileBudget = 48;
-const maximumBuildingFeatures = 5_000;
-const maximumVerticesPerTile = 260_000;
+// A ceiling on the single most expensive thing a tile can do to the main
+// thread: turning its buildings into a triangle mesh happens synchronously
+// during render, so however dense the source data is, one tile can only ever
+// cost this many vertices' worth of triangulation.
+const maximumBuildingFeatures = 3_000;
+const maximumVerticesPerTile = 130_000;
 const maximumTreesPerTile = 520;
 const earthRadiusMeters = 6_371_000;
 const structureHeightExaggeration = 1.35;

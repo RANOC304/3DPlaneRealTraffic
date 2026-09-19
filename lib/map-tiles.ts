@@ -377,20 +377,39 @@ function terrainOffset(elevationMeters: number, baseRadius: number) {
   return (elevationMeters / earthRadiusMeters) * baseRadius * terrainExaggeration;
 }
 
-/** Terrain-aware surface radius below a world-space camera position. */
-export function terrainSurfaceRadiusAtMercator(globalX: number, globalY: number, baseRadius: number) {
-  const normalizedX = ((globalX % 1) + 1) % 1;
-  const normalizedY = Math.max(0, Math.min(1 - Number.EPSILON, globalY));
+// Shared by every "what terrain do we actually have under this point" query so
+// the walk from finest to coarsest DEM tile is written once.
+function finestTerrainEntry(normalizedX: number, normalizedY: number) {
   for (let zoom = maxTerrainZoom; zoom >= baseMapZoom; zoom--) {
     const count = 2 ** zoom;
     const x = Math.min(count - 1, Math.floor(normalizedX * count));
     const y = Math.min(count - 1, Math.floor(normalizedY * count));
     const entry = terrainEntries.get(mapTileKey(zoom, x, y));
-    if (entry?.status !== 'ready' || !entry.tile) continue;
-    entry.usedAt = performance.now();
-    return baseRadius + terrainOffset(sampleTerrain(entry.tile, normalizedX, normalizedY), baseRadius);
+    if (entry?.status === 'ready' && entry.tile) return { zoom, tile: entry.tile, entry };
   }
-  return baseRadius;
+  return null;
+}
+
+/** Terrain-aware surface radius below a world-space camera position. */
+export function terrainSurfaceRadiusAtMercator(globalX: number, globalY: number, baseRadius: number) {
+  const normalizedX = ((globalX % 1) + 1) % 1;
+  const normalizedY = Math.max(0, Math.min(1 - Number.EPSILON, globalY));
+  const found = finestTerrainEntry(normalizedX, normalizedY);
+  if (!found) return baseRadius;
+  found.entry.usedAt = performance.now();
+  return baseRadius + terrainOffset(sampleTerrain(found.tile, normalizedX, normalizedY), baseRadius);
+}
+
+/**
+ * The zoom level of the sharpest DEM tile currently backing this point, or -1
+ * when none has loaded yet. Building geometry keys itself off this instead of
+ * "any terrain tile anywhere just arrived" so a rebuild only fires for the
+ * tiles whose own ground actually got more accurate.
+ */
+export function finestTerrainZoomAtMercator(globalX: number, globalY: number) {
+  const normalizedX = ((globalX % 1) + 1) % 1;
+  const normalizedY = Math.max(0, Math.min(1 - Number.EPSILON, globalY));
+  return finestTerrainEntry(normalizedX, normalizedY)?.zoom ?? -1;
 }
 
 /** Terrain-aware surface radius below a world-space camera position. */
