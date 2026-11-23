@@ -5,6 +5,8 @@
 // Derived from the OpenFlights airline database (https://openflights.org/data.html),
 // filtered to carriers that publish both codes, preferring active operators, plus
 // corrections for codes reassigned since that dataset was published.
+// Database: ODbL-1.0 (https://opendatacommons.org/licenses/odbl/1-0/).
+// Database contents: DbCL-1.0 (https://opendatacommons.org/licenses/dbcl/1-0/).
 export const iataToIcaoAirline: Record<string, string> = {
   "04":"ABV", "0A":"GNT", "0B":"JOR", "0D":"DWT", "0J":"JCS", "0P":"PYB", "10":"CNN", "13":"EAV", "1A":"AGT",
   "1E":"RGG", "1F":"CIF", "1H":"HEY", "1I":"EJA", "1L":"OSY", "1T":"RNX", "20":"RNE", "2B":"ARD", "2D":"AOG",

@@ -1,23 +1,25 @@
 # Skytrace
 
-Skytrace is a React + WebGL live air-traffic viewer built around a fully interactive 3D Earth. It retrieves current state vectors from the OpenSky Network through a server-side proxy, renders thousands of aircraft efficiently with instancing, and predicts movement between data snapshots.
+Skytrace is a React and WebGL air-traffic viewer with an interactive 3D Earth, live aircraft positions, and a free-flight camera. Search for a flight, select an aircraft to follow it, or fly down to the terrain and explore.
+
+![Skytrace live 3D air traffic](public/og.png)
 
 ## Run locally
 
-```bash
-npm install
+Install Node.js 22.13 or later and npm. Run these commands from the repository root, then open [localhost:3000](http://localhost:3000).
+
+```sh
+npm ci
 npm run dev
 ```
 
-Open `http://localhost:3000`.
+Build a production bundle with `npm run build`. Run the built worker locally with `npm start`. Local development and builds require no hosting account.
 
-No API credentials are required for the basic experience. Anonymous OpenSky requests are cached for 15 minutes to stay inside the free global-request allowance. Aircraft still move continuously at 60 FPS between snapshots using their real speed, heading, climb rate, and last-contact time. Adding a free OpenSky API client raises the allowance to 4,000 credits a day; a global snapshot costs four of them, so the server reads the remaining balance from each response and paces itself to spend the day's credits evenly — about every 90 seconds. Copy `.env.example` to `.env.local`:
+### Configuration
 
-```env
-OPENSKY_CLIENT_ID=your_client_id
-OPENSKY_CLIENT_SECRET=your_client_secret
-NEXT_PUBLIC_SITE_URL=http://localhost:3000
-```
+The development server can start without credentials. For optional settings, copy [`.env.example`](.env.example) to `.env.local`. Keep the OpenSky client secret server-side. Set `NEXT_PUBLIC_SITE_URL` to the deployed origin for social-preview links. The example file also lists overrides for imagery, elevation, and vector tile sources.
+
+OpenSky requires written permission for commercial use and for operational use of its API in a live service or automated system. Review the provider terms and attribution requirements before deploying with live data. [OpenSky terms](https://opensky-network.org/about/terms-of-use) · [Third-party notices](THIRD_PARTY_NOTICES.md)
 
 ## Camera controls
 
@@ -35,10 +37,18 @@ NEXT_PUBLIC_SITE_URL=http://localhost:3000
 
 ## Data coverage
 
-OpenSky is free and keyless at its anonymous tier, but it is a community receiver network—not a certified, complete registry of every aircraft worldwide. Some aircraft, regions, registrations, routes, and airport details may be missing. Skytrace shows the complete set of position-bearing states returned by the current OpenSky snapshot and clearly switches to preview data if the live source is unavailable.
+Skytrace plots position-bearing states returned by OpenSky. Receiver coverage varies by region, so aircraft and route details can be missing. When OpenSky is unavailable, the globe can show labeled preview aircraft.
 
-The whole-Earth base uses NASA Blue Marble imagery, over which Esri World Imagery satellite tiles are draped as a level-of-detail pyramid. Mapzen Terrarium elevation tiles displace that imagery into lit 3D terrain, with a modest vertical exaggeration so relief remains legible from the flight camera. At low altitude, OpenFreeMap vector tiles add OpenStreetMap buildings, building parts, and mapped bridge decks as height-aware 3D solids, plus a lightweight forest canopy over mapped woodland. These local objects stream only around the camera and disappear above orbital viewing height so the worldwide flight view remains responsive. A complete low-zoom layer of the entire globe stays loaded at all times, and finer imagery and elevation are requested coarse-first for whatever the camera can actually see. A tile that has not arrived yet draws the matching part of the nearest tile that has, so moving and zooming sharpen the map in place rather than blanking it. The globe stays photographic at every scale instead of switching to a street-map style.
+The globe combines NASA Blue Marble imagery, Esri satellite tiles, and Mapzen Terrarium elevation data. At low altitude, OpenFreeMap tiles add buildings, bridges, and forest canopy drawn from OpenStreetMap. Finer tiles load around the camera as you move.
 
-Aircraft state vectors come from two feeds with different jobs. OpenSky supplies the worldwide backdrop, but a global snapshot is billed against a daily credit allowance, so it can only refresh about every 90 seconds no matter how the key is paced. Real-time motion comes from the community aggregators adsb.lol and adsb.fi, which republish roughly once a second: the airspace the camera is looking at is refetched every five seconds, so the aircraft you are actually watching move from fresh fixes rather than from extrapolation. Where both feeds see the same airframe, the newer fix wins.
+OpenSky supplies global snapshots. Anonymous requests are cached for 15 minutes, and authenticated refreshes are paced against the API's reported credit allowance. The map fetches more frequent local fixes from adsb.lol and ADSB.fi as you move the camera. When both feeds see the same aircraft, the newer fix wins. Aircraft move between fixes using their reported speed, heading, and climb rate.
 
-Because every predicted position is the last reported one advanced by `speed x (now - report time)`, a browser or server clock that disagrees with the feeds would distort the whole fleet — and a clock far enough out would pin every aircraft against the prediction limits and freeze the sky. Neither end trusts its own clock: both discipline an offset against the timestamps the feeds carry, so aircraft times and the clock they are measured against always share one time base. If the machine's own clock is off by more than half a minute, the data-link panel says so. Selecting or searching a flight also resolves its itinerary and airline from adsbdb, and a photograph of the specific airframe from [Planespotters.net](https://www.planespotters.net/photo/api), credited to the photographer and linked to the original. Departure and arrival times are derived from the observed track and current ground speed — no free source publishes airline schedules, so nothing here is presented as a scheduled time.
+The browser and server use feed timestamps to keep position predictions aligned. The data-link panel flags clock differences greater than 30 seconds. When available, flight details include route and airline information from adsbdb and an aircraft photo credited to its photographer. Departure and arrival estimates use the observed track and current ground speed. [Planespotters.net Photo API](https://www.planespotters.net/photo/api)
+
+## Contributing
+
+Bug reports and pull requests are welcome. See the [contributing guide](CONTRIBUTING.md) for what to include.
+
+## License
+
+Skytrace's original source code is available under the [MIT License](LICENSE). Bundled third-party material and external data services have their own terms. See the [third-party notices](THIRD_PARTY_NOTICES.md).
